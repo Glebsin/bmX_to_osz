@@ -1,6 +1,7 @@
 primarily for - https://github.com/Glebsin/iidx2bms/
 
 flags:
+
 -add7k
 Create both versions: normal 8K and additional 7K (scratch-cut).
 
