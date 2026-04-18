@@ -130,12 +130,25 @@ typedef struct {
 } PackItem;
 
 typedef struct {
+    char **keys;
+    size_t cap;
+    size_t len;
+} ArcSet;
+
+typedef struct {
     PackItem *items;
     size_t len;
     size_t cap;
+    ArcSet arcs;
 } PackVec;
 
 static volatile LONG g_bg_pick_seq = 0;
+
+#if defined(_MSC_VER)
+#define TLSVAR __declspec(thread)
+#else
+#define TLSVAR __thread
+#endif
 
 
 static void *xrealloc(void *ptr, size_t size) {
@@ -228,15 +241,57 @@ static void pack_push(PackVec *v, const char *src, const char *arc) {
     v->len++;
 }
 
-static int pack_has_arc(const PackVec *v, const char *arc) {
-    for (size_t i = 0; i < v->len; i++) {
-        if (_stricmp(v->items[i].arc_name, arc) == 0) return 1;
+static uint32_t hash_ci(const char *s) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= (uint32_t)tolower(*p);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void arcset_rehash(ArcSet *s, size_t new_cap) {
+    char **old = s->keys;
+    size_t old_cap = s->cap;
+    s->keys = (char **)xrealloc(NULL, new_cap * sizeof(char *));
+    for (size_t i = 0; i < new_cap; i++) s->keys[i] = NULL;
+    s->cap = new_cap;
+    s->len = 0;
+    for (size_t i = 0; i < old_cap; i++) {
+        if (!old || !old[i]) continue;
+        uint32_t h = hash_ci(old[i]);
+        size_t m = new_cap - 1;
+        for (size_t k = 0; k < new_cap; k++) {
+            size_t pos = (h + (uint32_t)k) & m;
+            if (!s->keys[pos]) {
+                s->keys[pos] = old[i];
+                s->len++;
+                break;
+            }
+        }
+    }
+    free(old);
+}
+
+static int arcset_insert_if_new(ArcSet *s, const char *key) {
+    if (s->cap == 0) arcset_rehash(s, 128);
+    if ((s->len + 1) * 10 >= s->cap * 7) arcset_rehash(s, s->cap * 2);
+    uint32_t h = hash_ci(key);
+    size_t m = s->cap - 1;
+    for (size_t k = 0; k < s->cap; k++) {
+        size_t pos = (h + (uint32_t)k) & m;
+        if (!s->keys[pos]) {
+            s->keys[pos] = xstrdup(key);
+            s->len++;
+            return 1;
+        }
+        if (_stricmp(s->keys[pos], key) == 0) return 0;
     }
     return 0;
 }
 
 static void pack_push_unique(PackVec *v, const char *src, const char *arc) {
-    if (!pack_has_arc(v, arc)) pack_push(v, src, arc);
+    if (arcset_insert_if_new(&v->arcs, arc)) pack_push(v, src, arc);
 }
 
 static void pack_free(PackVec *v) {
@@ -245,8 +300,14 @@ static void pack_free(PackVec *v) {
         free(v->items[i].arc_name);
     }
     free(v->items);
+    if (v->arcs.keys) {
+        for (size_t i = 0; i < v->arcs.cap; i++) free(v->arcs.keys[i]);
+        free(v->arcs.keys);
+    }
     v->items = NULL;
     v->len = v->cap = 0;
+    v->arcs.keys = NULL;
+    v->arcs.cap = v->arcs.len = 0;
 }
 
 static int cmp_note(const void *a, const void *b) {
@@ -839,7 +900,7 @@ static int parse_bms_file(const char *path, BmsContext *ctx, RawEventVec *raw_ev
     return 1;
 }
 
-static void split_raw_events(const RawEventVec *raw, NoteEventVec *notes, RawEventVec *timing, RawEventVec *bgm, int *max_lane, int *max_measure, int cut_scratch, int token_base) {
+static void split_raw_events(const RawEventVec *raw, NoteEventVec *notes, RawEventVec *timing, RawEventVec *bgm, int *max_lane, int *max_measure, int cut_scratch) {
     *max_lane = -1;
     *max_measure = 0;
     int has_16 = 0, has_17 = 0, has_18_19 = 0;
@@ -869,7 +930,7 @@ static void split_raw_events(const RawEventVec *raw, NoteEventVec *notes, RawEve
             ne.measure = measure;
             ne.is_ln = is_ln;
             ne.id = (int)notes->len;
-            ne.wav_id = decode_token2(re.token, token_base);
+            ne.wav_id = re.token_id;
             note_push(notes, ne);
             if (lane > *max_lane) *max_lane = lane;
             continue;
@@ -903,6 +964,36 @@ static double beats_to_ms(double beats, double bpm) {
     return beats * (60000.0 / bpm);
 }
 
+static TLSVAR int *tls_note_time = NULL;
+static TLSVAR size_t tls_note_time_cap = 0;
+static TLSVAR int *tls_bgm_time = NULL;
+static TLSVAR size_t tls_bgm_time_cap = 0;
+static TLSVAR NoteEvent *tls_sorted_notes = NULL;
+static TLSVAR size_t tls_sorted_notes_cap = 0;
+static TLSVAR RawEvent *tls_timing_sorted = NULL;
+static TLSVAR size_t tls_timing_sorted_cap = 0;
+static TLSVAR RawEventIdx *tls_bgm_sorted = NULL;
+static TLSVAR size_t tls_bgm_sorted_cap = 0;
+static TLSVAR int *tls_timing_start = NULL;
+static TLSVAR int *tls_timing_end = NULL;
+static TLSVAR size_t tls_timing_start_cap = 0;
+static TLSVAR size_t tls_timing_end_cap = 0;
+static TLSVAR int *tls_bgm_start = NULL;
+static TLSVAR int *tls_bgm_end = NULL;
+static TLSVAR size_t tls_bgm_start_cap = 0;
+static TLSVAR size_t tls_bgm_end_cap = 0;
+
+static void *tls_ensure_buf(void *ptr, size_t *cap, size_t need, size_t elem_sz) {
+    if (need == 0) need = 1;
+    if (*cap < need) {
+        size_t nc = *cap ? *cap : 256;
+        while (nc < need) nc *= 2;
+        ptr = xrealloc(ptr, nc * elem_sz);
+        *cap = nc;
+    }
+    return ptr;
+}
+
 static void generate_timing_and_notes(
     const BmsContext *ctx,
     const NoteEventVec *notes,
@@ -913,36 +1004,76 @@ static void generate_timing_and_notes(
     TimingPointVec *timing_points,
     AutoSampleVec *auto_samples) {
 
-    int *note_time = (int *)xrealloc(NULL, notes->len * sizeof(int));
-    for (size_t i = 0; i < notes->len; i++) note_time[i] = 0;
-    int *bgm_time = (int *)xrealloc(NULL, (bgm_raw->len ? bgm_raw->len : 1) * sizeof(int));
-    for (size_t i = 0; i < bgm_raw->len; i++) bgm_time[i] = 0;
+    int *note_time = NULL;
+    int *bgm_time = NULL;
     NoteEvent *sorted_notes = NULL;
     RawEvent *timing_sorted = NULL;
     RawEventIdx *bgm_sorted = NULL;
-    size_t note_pos = 0, timing_pos = 0, bgm_pos = 0;
+    int *timing_start = NULL;
+    int *timing_end = NULL;
+    int *bgm_start = NULL;
+    int *bgm_end = NULL;
+    size_t note_pos = 0;
+
+    tls_note_time = (int *)tls_ensure_buf(tls_note_time, &tls_note_time_cap, notes->len, sizeof(int));
+    note_time = tls_note_time;
+    if (notes->len > 0) memset(note_time, 0, notes->len * sizeof(int));
+    tls_bgm_time = (int *)tls_ensure_buf(tls_bgm_time, &tls_bgm_time_cap, bgm_raw->len, sizeof(int));
+    bgm_time = tls_bgm_time;
+    if (bgm_raw->len > 0) memset(bgm_time, 0, bgm_raw->len * sizeof(int));
 
     tp_push(timing_points, (TimingPoint){0, ctx->initial_bpm});
 
     double cur_time = 0.0;
     double cur_bpm = ctx->initial_bpm;
     if (notes->len > 0) {
-        sorted_notes = (NoteEvent *)xrealloc(NULL, notes->len * sizeof(NoteEvent));
+        tls_sorted_notes = (NoteEvent *)tls_ensure_buf(tls_sorted_notes, &tls_sorted_notes_cap, notes->len, sizeof(NoteEvent));
+        sorted_notes = tls_sorted_notes;
         memcpy(sorted_notes, notes->items, notes->len * sizeof(NoteEvent));
         qsort(sorted_notes, notes->len, sizeof(NoteEvent), cmp_note);
     }
     if (timing_raw->len > 0) {
-        timing_sorted = (RawEvent *)xrealloc(NULL, timing_raw->len * sizeof(RawEvent));
+        tls_timing_sorted = (RawEvent *)tls_ensure_buf(tls_timing_sorted, &tls_timing_sorted_cap, timing_raw->len, sizeof(RawEvent));
+        timing_sorted = tls_timing_sorted;
         memcpy(timing_sorted, timing_raw->items, timing_raw->len * sizeof(RawEvent));
         qsort(timing_sorted, timing_raw->len, sizeof(RawEvent), cmp_raw_measure_pos);
+        tls_timing_start = (int *)tls_ensure_buf(tls_timing_start, &tls_timing_start_cap, (size_t)last_measure + 1, sizeof(int));
+        tls_timing_end = (int *)tls_ensure_buf(tls_timing_end, &tls_timing_end_cap, (size_t)last_measure + 1, sizeof(int));
+        timing_start = tls_timing_start;
+        timing_end = tls_timing_end;
+        for (int m = 0; m <= last_measure; m++) {
+            timing_start[m] = -1;
+            timing_end[m] = -1;
+        }
+        for (size_t i = 0; i < timing_raw->len; i++) {
+            int rm = timing_sorted[i].channel / 1000;
+            if (rm < 0 || rm > last_measure) continue;
+            if (timing_start[rm] < 0) timing_start[rm] = (int)i;
+            timing_end[rm] = (int)i + 1;
+        }
     }
     if (bgm_raw->len > 0) {
-        bgm_sorted = (RawEventIdx *)xrealloc(NULL, bgm_raw->len * sizeof(RawEventIdx));
+        tls_bgm_sorted = (RawEventIdx *)tls_ensure_buf(tls_bgm_sorted, &tls_bgm_sorted_cap, bgm_raw->len, sizeof(RawEventIdx));
+        bgm_sorted = tls_bgm_sorted;
         for (size_t i = 0; i < bgm_raw->len; i++) {
             bgm_sorted[i].ev = bgm_raw->items[i];
             bgm_sorted[i].orig_index = (int)i;
         }
         qsort(bgm_sorted, bgm_raw->len, sizeof(RawEventIdx), cmp_rawidx_measure_pos);
+        tls_bgm_start = (int *)tls_ensure_buf(tls_bgm_start, &tls_bgm_start_cap, (size_t)last_measure + 1, sizeof(int));
+        tls_bgm_end = (int *)tls_ensure_buf(tls_bgm_end, &tls_bgm_end_cap, (size_t)last_measure + 1, sizeof(int));
+        bgm_start = tls_bgm_start;
+        bgm_end = tls_bgm_end;
+        for (int m = 0; m <= last_measure; m++) {
+            bgm_start[m] = -1;
+            bgm_end[m] = -1;
+        }
+        for (size_t i = 0; i < bgm_raw->len; i++) {
+            int rm = bgm_sorted[i].ev.channel / 1000;
+            if (rm < 0 || rm > last_measure) continue;
+            if (bgm_start[rm] < 0) bgm_start[rm] = (int)i;
+            bgm_end[rm] = (int)i + 1;
+        }
     }
 
     for (int m = 0; m <= last_measure; m++) {
@@ -953,39 +1084,35 @@ static void generate_timing_and_notes(
             mev_push(&mev, (MeasureEvent){sorted_notes[i].pos, 2, 0.0, sorted_notes[i].id});
         }
 
-        while (timing_pos < timing_raw->len && timing_sorted[timing_pos].channel / 1000 < m) timing_pos++;
-        size_t t = timing_pos;
-        while (t < timing_raw->len && timing_sorted[t].channel / 1000 == m) {
-            int ch = timing_sorted[t].channel % 1000;
-            const char *tk = timing_sorted[t].token;
-            if (ch == 3) {
-                char hex[3] = {tk[0], tk[1], '\0'};
-                long v = strtol(hex, NULL, 16);
-                if (v > 0) {
-                    mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, (double)v, -1});
-                }
-            } else if (ch == 8) {
-                int idx = timing_sorted[t].token_id;
-                if (idx >= 0 && ctx->bpm_ext_set[idx] && ctx->bpm_ext[idx] > 0.0) {
-                    mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, ctx->bpm_ext[idx], -1});
-                }
-            } else if (ch == 9) {
-                int idx = timing_sorted[t].token_id;
-                if (idx >= 0 && ctx->stop_ext_set[idx]) {
-                    mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 1, ctx->stop_ext[idx], -1});
+        if (timing_start && timing_start[m] >= 0) {
+            for (int t = timing_start[m]; t < timing_end[m]; t++) {
+                int ch = timing_sorted[t].channel % 1000;
+                const char *tk = timing_sorted[t].token;
+                if (ch == 3) {
+                    char hex[3] = {tk[0], tk[1], '\0'};
+                    long v = strtol(hex, NULL, 16);
+                    if (v > 0) {
+                        mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, (double)v, -1});
+                    }
+                } else if (ch == 8) {
+                    int idx = timing_sorted[t].token_id;
+                    if (idx >= 0 && ctx->bpm_ext_set[idx] && ctx->bpm_ext[idx] > 0.0) {
+                        mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, ctx->bpm_ext[idx], -1});
+                    }
+                } else if (ch == 9) {
+                    int idx = timing_sorted[t].token_id;
+                    if (idx >= 0 && ctx->stop_ext_set[idx]) {
+                        mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 1, ctx->stop_ext[idx], -1});
+                    }
                 }
             }
-            t++;
         }
-        timing_pos = t;
 
-        while (bgm_pos < bgm_raw->len && bgm_sorted[bgm_pos].ev.channel / 1000 < m) bgm_pos++;
-        size_t b = bgm_pos;
-        while (b < bgm_raw->len && bgm_sorted[b].ev.channel / 1000 == m) {
-            mev_push(&mev, (MeasureEvent){bgm_sorted[b].ev.pos, 3, 0.0, bgm_sorted[b].orig_index});
-            b++;
+        if (bgm_start && bgm_start[m] >= 0) {
+            for (int b = bgm_start[m]; b < bgm_end[m]; b++) {
+                mev_push(&mev, (MeasureEvent){bgm_sorted[b].ev.pos, 3, 0.0, bgm_sorted[b].orig_index});
+            }
         }
-        bgm_pos = b;
 
         if (mev.len > 0) {
             qsort(mev.items, mev.len, sizeof(MeasureEvent), cmp_mev);
@@ -1077,13 +1204,28 @@ static void generate_timing_and_notes(
             auto_push(auto_samples, (AutoSample){bgm_time[i], wav_id});
         }
     }
-    if (auto_samples->len > 1) qsort(auto_samples->items, auto_samples->len, sizeof(AutoSample), cmp_auto);
+    if (auto_samples->len > 1) {
+        int sorted = 1;
+        for (size_t i = 1; i < auto_samples->len; i++) {
+            AutoSample a = auto_samples->items[i - 1];
+            AutoSample b = auto_samples->items[i];
+            if (a.time_ms > b.time_ms || (a.time_ms == b.time_ms && a.wav_id > b.wav_id)) {
+                sorted = 0;
+                break;
+            }
+        }
+        if (!sorted) qsort(auto_samples->items, auto_samples->len, sizeof(AutoSample), cmp_auto);
+    }
+}
 
-    free(note_time);
-    free(bgm_time);
-    free(sorted_notes);
-    free(timing_sorted);
-    free(bgm_sorted);
+static int osu_is_sorted(const OsuNoteVec *v) {
+    for (size_t i = 1; i < v->len; i++) {
+        const OsuNote *a = &v->items[i - 1];
+        const OsuNote *b = &v->items[i];
+        if (a->time_ms > b->time_ms) return 0;
+        if (a->time_ms == b->time_ms && a->lane > b->lane) return 0;
+    }
+    return 1;
 }
 
 static void dedupe_timing_points(TimingPointVec *tp) {
@@ -1484,13 +1626,6 @@ static int collect_chart_files_in_dir(const char *dir, StringVec *out) {
     return out->len > before;
 }
 
-static int has_chart_files_in_dir(const char *dir) {
-    StringVec tmp = {0};
-    int ok = collect_chart_files_in_dir(dir, &tmp);
-    str_free(&tmp);
-    return ok;
-}
-
 static int get_exe_dir(char *out, size_t out_sz) {
     DWORD n = GetModuleFileNameA(NULL, out, (DWORD)out_sz);
     if (n == 0 || n >= out_sz) return 0;
@@ -1515,9 +1650,7 @@ static int strvec_contains_icase(const StringVec *v, const char *s) {
 static void collect_map_dirs(const char *target, StringVec *out_dirs) {
     if (!dir_exists(target)) return;
 
-    if (has_chart_files_in_dir(target)) {
-        if (!strvec_contains_icase(out_dirs, target)) str_push(out_dirs, target);
-    }
+    if (!strvec_contains_icase(out_dirs, target)) str_push(out_dirs, target);
 
     char pat[4096];
     snprintf(pat, sizeof(pat), "%s\\*", target);
@@ -1529,9 +1662,7 @@ static void collect_map_dirs(const char *target, StringVec *out_dirs) {
         if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
         char subdir[4096];
         join_path(subdir, sizeof(subdir), target, fd.cFileName);
-        if (has_chart_files_in_dir(subdir)) {
-            if (!strvec_contains_icase(out_dirs, subdir)) str_push(out_dirs, subdir);
-        }
+        if (!strvec_contains_icase(out_dirs, subdir)) str_push(out_dirs, subdir);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 }
@@ -1637,7 +1768,7 @@ static int process_single_chart(const char *input, const char *tmp_dir, int opt_
         RawEventVec bgm = {0};
         int max_lane = -1;
         int max_measure_notes = 0;
-        split_raw_events(&raw, &notes, &timing, &bgm, &max_lane, &max_measure_notes, cut_scratch, ctx.token_base);
+        split_raw_events(&raw, &notes, &timing, &bgm, &max_lane, &max_measure_notes, cut_scratch);
 
         int last_measure = ctx.max_measure_seen;
         if (max_measure_notes > last_measure) last_measure = max_measure_notes;
@@ -1648,7 +1779,7 @@ static int process_single_chart(const char *input, const char *tmp_dir, int opt_
 
         generate_timing_and_notes(&ctx, &notes, &timing, &bgm, last_measure, &osu, &tp, &auto_samples);
         dedupe_timing_points(&tp);
-        if (osu.len > 0) qsort(osu.items, osu.len, sizeof(OsuNote), cmp_osu);
+        if (osu.len > 1 && !osu_is_sorted(&osu)) qsort(osu.items, osu.len, sizeof(OsuNote), cmp_osu);
         double od_value = od_from_bms_rank_fixed(ctx.rank_bms);
 
         if (keys == 8) {
@@ -1713,6 +1844,43 @@ static unsigned __stdcall chart_worker_proc(void *arg) {
     return 0;
 }
 
+typedef struct {
+    PackVec pack;
+    char osz_path[4096];
+    char tmp_dir[4096];
+    int ok;
+} ZipTask;
+
+static unsigned __stdcall zip_worker_proc(void *arg) {
+    ZipTask *z = (ZipTask *)arg;
+    z->ok = create_zip_store(z->osz_path, &z->pack);
+    return 0;
+}
+
+static void cleanup_tmp_from_pack(const char *tmp_dir, PackVec *pack) {
+    size_t n = strlen(tmp_dir);
+    for (size_t i = 0; i < pack->len; i++) {
+        if (_strnicmp(pack->items[i].src_path, tmp_dir, n) == 0) {
+            DeleteFileA(pack->items[i].src_path);
+        }
+    }
+    RemoveDirectoryA(tmp_dir);
+}
+
+static void finish_zip_task(ZipTask *z, int *overall_ok) {
+    if (!z) return;
+    if (!z->ok) {
+        fprintf(stderr, "Failed to create archive: %s\n", z->osz_path);
+        if (overall_ok) *overall_ok = 0;
+    } else {
+        printf("Created: %s\n", z->osz_path);
+    }
+    cleanup_tmp_from_pack(z->tmp_dir, &z->pack);
+    pack_free(&z->pack);
+    z->tmp_dir[0] = '\0';
+    z->osz_path[0] = '\0';
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <map_folder OR root_folder_with_map_subfolders> [-add7k|-only7k] [-addvideo]\n", argv[0]);
@@ -1760,6 +1928,10 @@ int main(int argc, char **argv) {
     }
 
     int overall_ok = 1;
+    HANDLE zip_th = NULL;
+    ZipTask zip_pending;
+    memset(&zip_pending, 0, sizeof(zip_pending));
+    int zip_pending_active = 0;
     for (size_t mdi = 0; mdi < map_dirs.len; mdi++) {
         const char *map_dir = map_dirs.items[mdi];
         StringVec charts = {0};
@@ -1845,21 +2017,43 @@ int main(int argc, char **argv) {
         char osz_name[320], osz_path[4096];
         snprintf(osz_name, sizeof(osz_name), "%s.osz", map_name);
         join_path(osz_path, sizeof(osz_path), out_dir, osz_name);
-        if (!create_zip_store(osz_path, &pack)) {
-            fprintf(stderr, "Failed to create archive: %s\n", osz_path);
-            overall_ok = 0;
-        } else {
-            printf("Created: %s\n", osz_path);
+        if (zip_pending_active) {
+            WaitForSingleObject(zip_th, INFINITE);
+            CloseHandle(zip_th);
+            zip_th = NULL;
+            finish_zip_task(&zip_pending, &overall_ok);
+            zip_pending_active = 0;
         }
 
-        for (size_t i = 0; i < pack.len; i++) {
-            if (_strnicmp(pack.items[i].src_path, tmp_dir, strlen(tmp_dir)) == 0) {
-                DeleteFileA(pack.items[i].src_path);
+        zip_pending.pack = pack;
+        pack.items = NULL;
+        pack.len = pack.cap = 0;
+        pack.arcs.keys = NULL;
+        pack.arcs.cap = pack.arcs.len = 0;
+        snprintf(zip_pending.tmp_dir, sizeof(zip_pending.tmp_dir), "%s", tmp_dir);
+        snprintf(zip_pending.osz_path, sizeof(zip_pending.osz_path), "%s", osz_path);
+        zip_pending.ok = 0;
+
+        {
+            unsigned ztid = 0;
+            zip_th = (HANDLE)_beginthreadex(NULL, 0, zip_worker_proc, &zip_pending, 0, &ztid);
+            if (!zip_th) {
+                zip_pending.ok = create_zip_store(zip_pending.osz_path, &zip_pending.pack);
+                finish_zip_task(&zip_pending, &overall_ok);
+                zip_pending_active = 0;
+            } else {
+                zip_pending_active = 1;
             }
         }
-        RemoveDirectoryA(tmp_dir);
-        pack_free(&pack);
         str_free(&charts);
+    }
+
+    if (zip_pending_active) {
+        WaitForSingleObject(zip_th, INFINITE);
+        CloseHandle(zip_th);
+        zip_th = NULL;
+        finish_zip_task(&zip_pending, &overall_ok);
+        zip_pending_active = 0;
     }
 
     str_free(&bg_paths);
