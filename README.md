@@ -17,8 +17,11 @@ Important:
 usage example: 
 
 bmX_to_osz.exe "C:\Games\LR2oraja Endless Dream\music\maps"
+
 bmX_to_osz.exe "C:\Games\LR2oraja Endless Dream\music\bms\somemap"
+
 bmX_to_osz.exe "C:\Games\LR2oraja Endless Dream\music\othermaps" -add7k -addvideo
+
 bmX_to_osz.exe "C:\Games\LR2oraja Endless Dream\music\bms\somemap" -only7k
 
 
