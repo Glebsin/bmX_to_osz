@@ -7,7 +7,10 @@
 #include <stdint.h>
 #include <windows.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 #include <process.h>
+#include <wchar.h>
+#include <wctype.h>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "winmm.lib")
@@ -496,6 +499,129 @@ static int dir_exists(const char *path) {
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static int is_abs_path(const char *p) {
+    if (!p || !p[0]) return 0;
+    if ((isalpha((unsigned char)p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/'))) return 1;
+    if ((p[0] == '\\' && p[1] == '\\') || (p[0] == '/' && p[1] == '/')) return 1;
+    return 0;
+}
+
+static int wdir_exists(const wchar_t *path) {
+    DWORD a = GetFileAttributesW(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int is_abs_path_w(const wchar_t *p) {
+    if (!p || !p[0]) return 0;
+    if (iswalpha(p[0]) && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/')) return 1;
+    if ((p[0] == L'\\' && p[1] == L'\\') || (p[0] == L'/' && p[1] == L'/')) return 1;
+    return 0;
+}
+
+static void wpath_dirname(const wchar_t *path, wchar_t *out, size_t out_sz) {
+    wcsncpy(out, path, out_sz - 1);
+    out[out_sz - 1] = L'\0';
+    wchar_t *s1 = wcsrchr(out, L'/');
+    wchar_t *s2 = wcsrchr(out, L'\\');
+    wchar_t *s = NULL;
+    if (s1 && s2) s = (s1 > s2) ? s1 : s2;
+    else if (s1) s = s1;
+    else if (s2) s = s2;
+    if (!s) {
+        wcsncpy(out, L".", out_sz - 1);
+        out[out_sz - 1] = L'\0';
+        return;
+    }
+    *s = L'\0';
+}
+
+static void join_path_w(wchar_t *out, size_t out_sz, const wchar_t *dir, const wchar_t *name) {
+    if (!dir || !dir[0] || wcscmp(dir, L".") == 0) {
+        _snwprintf(out, out_sz - 1, L"%ls", name);
+        out[out_sz - 1] = L'\0';
+        return;
+    }
+    size_t n = wcslen(dir);
+    if (dir[n - 1] == L'\\' || dir[n - 1] == L'/') _snwprintf(out, out_sz - 1, L"%ls%ls", dir, name);
+    else _snwprintf(out, out_sz - 1, L"%ls\\%ls", dir, name);
+    out[out_sz - 1] = L'\0';
+}
+
+static int wide_to_ansi(const wchar_t *src, char *out, size_t out_sz) {
+    if (!src || !out || out_sz == 0) return 0;
+    BOOL used_default = FALSE;
+    int n = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, src, -1, out, (int)out_sz, NULL, &used_default);
+    if (n <= 0 || (size_t)n >= out_sz) return 0;
+    if (used_default) return 0;
+    return 1;
+}
+
+static int wide_dir_to_ansi_path(const wchar_t *wpath, char *out, size_t out_sz) {
+    if (wide_to_ansi(wpath, out, out_sz)) return 1;
+    wchar_t shortp[4096];
+    DWORD n = GetShortPathNameW(wpath, shortp, (DWORD)(sizeof(shortp) / sizeof(shortp[0])));
+    if (n > 0 && n < (DWORD)(sizeof(shortp) / sizeof(shortp[0]))) {
+        if (wide_to_ansi(shortp, out, out_sz)) return 1;
+    }
+    return 0;
+}
+
+static int resolve_input_dir_w(const wchar_t *input, const wchar_t *exe_dir_w, char *out, size_t out_sz) {
+    if (!input || !input[0]) return 0;
+    if (is_abs_path_w(input)) {
+        if (!wdir_exists(input)) return 0;
+        return wide_dir_to_ansi_path(input, out, out_sz);
+    }
+    if (wdir_exists(input)) {
+        return wide_dir_to_ansi_path(input, out, out_sz);
+    }
+    {
+        wchar_t p1[4096];
+        join_path_w(p1, sizeof(p1) / sizeof(p1[0]), exe_dir_w, input);
+        if (wdir_exists(p1)) return wide_dir_to_ansi_path(p1, out, out_sz);
+    }
+    {
+        wchar_t parent[4096];
+        wchar_t p2[4096];
+        wpath_dirname(exe_dir_w, parent, sizeof(parent) / sizeof(parent[0]));
+        join_path_w(p2, sizeof(p2) / sizeof(p2[0]), parent, input);
+        if (wdir_exists(p2)) return wide_dir_to_ansi_path(p2, out, out_sz);
+    }
+    return 0;
+}
+
+static int resolve_input_dir(const char *input, const char *exe_dir, char *out, size_t out_sz) {
+    if (!input || !input[0]) return 0;
+    if (is_abs_path(input)) {
+        if (!dir_exists(input)) return 0;
+        snprintf(out, out_sz, "%s", input);
+        return 1;
+    }
+    if (dir_exists(input)) {
+        snprintf(out, out_sz, "%s", input);
+        return 1;
+    }
+    {
+        char p1[4096];
+        join_path(p1, sizeof(p1), exe_dir, input);
+        if (dir_exists(p1)) {
+            snprintf(out, out_sz, "%s", p1);
+            return 1;
+        }
+    }
+    {
+        char parent[4096];
+        char p2[4096];
+        path_dirname(exe_dir, parent, sizeof(parent));
+        join_path(p2, sizeof(p2), parent, input);
+        if (dir_exists(p2)) {
+            snprintf(out, out_sz, "%s", p2);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int has_audio_ext(const char *name) {
     const char *dot = strrchr(name, '.');
     if (!dot) return 0;
@@ -974,14 +1100,6 @@ static TLSVAR RawEvent *tls_timing_sorted = NULL;
 static TLSVAR size_t tls_timing_sorted_cap = 0;
 static TLSVAR RawEventIdx *tls_bgm_sorted = NULL;
 static TLSVAR size_t tls_bgm_sorted_cap = 0;
-static TLSVAR int *tls_timing_start = NULL;
-static TLSVAR int *tls_timing_end = NULL;
-static TLSVAR size_t tls_timing_start_cap = 0;
-static TLSVAR size_t tls_timing_end_cap = 0;
-static TLSVAR int *tls_bgm_start = NULL;
-static TLSVAR int *tls_bgm_end = NULL;
-static TLSVAR size_t tls_bgm_start_cap = 0;
-static TLSVAR size_t tls_bgm_end_cap = 0;
 
 static void *tls_ensure_buf(void *ptr, size_t *cap, size_t need, size_t elem_sz) {
     if (need == 0) need = 1;
@@ -1009,11 +1127,7 @@ static void generate_timing_and_notes(
     NoteEvent *sorted_notes = NULL;
     RawEvent *timing_sorted = NULL;
     RawEventIdx *bgm_sorted = NULL;
-    int *timing_start = NULL;
-    int *timing_end = NULL;
-    int *bgm_start = NULL;
-    int *bgm_end = NULL;
-    size_t note_pos = 0;
+    size_t note_pos = 0, timing_pos = 0, bgm_pos = 0;
 
     tls_note_time = (int *)tls_ensure_buf(tls_note_time, &tls_note_time_cap, notes->len, sizeof(int));
     note_time = tls_note_time;
@@ -1037,20 +1151,6 @@ static void generate_timing_and_notes(
         timing_sorted = tls_timing_sorted;
         memcpy(timing_sorted, timing_raw->items, timing_raw->len * sizeof(RawEvent));
         qsort(timing_sorted, timing_raw->len, sizeof(RawEvent), cmp_raw_measure_pos);
-        tls_timing_start = (int *)tls_ensure_buf(tls_timing_start, &tls_timing_start_cap, (size_t)last_measure + 1, sizeof(int));
-        tls_timing_end = (int *)tls_ensure_buf(tls_timing_end, &tls_timing_end_cap, (size_t)last_measure + 1, sizeof(int));
-        timing_start = tls_timing_start;
-        timing_end = tls_timing_end;
-        for (int m = 0; m <= last_measure; m++) {
-            timing_start[m] = -1;
-            timing_end[m] = -1;
-        }
-        for (size_t i = 0; i < timing_raw->len; i++) {
-            int rm = timing_sorted[i].channel / 1000;
-            if (rm < 0 || rm > last_measure) continue;
-            if (timing_start[rm] < 0) timing_start[rm] = (int)i;
-            timing_end[rm] = (int)i + 1;
-        }
     }
     if (bgm_raw->len > 0) {
         tls_bgm_sorted = (RawEventIdx *)tls_ensure_buf(tls_bgm_sorted, &tls_bgm_sorted_cap, bgm_raw->len, sizeof(RawEventIdx));
@@ -1060,20 +1160,6 @@ static void generate_timing_and_notes(
             bgm_sorted[i].orig_index = (int)i;
         }
         qsort(bgm_sorted, bgm_raw->len, sizeof(RawEventIdx), cmp_rawidx_measure_pos);
-        tls_bgm_start = (int *)tls_ensure_buf(tls_bgm_start, &tls_bgm_start_cap, (size_t)last_measure + 1, sizeof(int));
-        tls_bgm_end = (int *)tls_ensure_buf(tls_bgm_end, &tls_bgm_end_cap, (size_t)last_measure + 1, sizeof(int));
-        bgm_start = tls_bgm_start;
-        bgm_end = tls_bgm_end;
-        for (int m = 0; m <= last_measure; m++) {
-            bgm_start[m] = -1;
-            bgm_end[m] = -1;
-        }
-        for (size_t i = 0; i < bgm_raw->len; i++) {
-            int rm = bgm_sorted[i].ev.channel / 1000;
-            if (rm < 0 || rm > last_measure) continue;
-            if (bgm_start[rm] < 0) bgm_start[rm] = (int)i;
-            bgm_end[rm] = (int)i + 1;
-        }
     }
 
     for (int m = 0; m <= last_measure; m++) {
@@ -1084,35 +1170,39 @@ static void generate_timing_and_notes(
             mev_push(&mev, (MeasureEvent){sorted_notes[i].pos, 2, 0.0, sorted_notes[i].id});
         }
 
-        if (timing_start && timing_start[m] >= 0) {
-            for (int t = timing_start[m]; t < timing_end[m]; t++) {
-                int ch = timing_sorted[t].channel % 1000;
-                const char *tk = timing_sorted[t].token;
-                if (ch == 3) {
-                    char hex[3] = {tk[0], tk[1], '\0'};
-                    long v = strtol(hex, NULL, 16);
-                    if (v > 0) {
-                        mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, (double)v, -1});
-                    }
-                } else if (ch == 8) {
-                    int idx = timing_sorted[t].token_id;
-                    if (idx >= 0 && ctx->bpm_ext_set[idx] && ctx->bpm_ext[idx] > 0.0) {
-                        mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, ctx->bpm_ext[idx], -1});
-                    }
-                } else if (ch == 9) {
-                    int idx = timing_sorted[t].token_id;
-                    if (idx >= 0 && ctx->stop_ext_set[idx]) {
-                        mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 1, ctx->stop_ext[idx], -1});
-                    }
+        while (timing_pos < timing_raw->len && timing_sorted[timing_pos].channel / 1000 < m) timing_pos++;
+        size_t t = timing_pos;
+        while (t < timing_raw->len && timing_sorted[t].channel / 1000 == m) {
+            int ch = timing_sorted[t].channel % 1000;
+            const char *tk = timing_sorted[t].token;
+            if (ch == 3) {
+                char hex[3] = {tk[0], tk[1], '\0'};
+                long v = strtol(hex, NULL, 16);
+                if (v > 0) {
+                    mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, (double)v, -1});
+                }
+            } else if (ch == 8) {
+                int idx = timing_sorted[t].token_id;
+                if (idx >= 0 && ctx->bpm_ext_set[idx] && ctx->bpm_ext[idx] > 0.0) {
+                    mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 0, ctx->bpm_ext[idx], -1});
+                }
+            } else if (ch == 9) {
+                int idx = timing_sorted[t].token_id;
+                if (idx >= 0 && ctx->stop_ext_set[idx]) {
+                    mev_push(&mev, (MeasureEvent){timing_sorted[t].pos, 1, ctx->stop_ext[idx], -1});
                 }
             }
+            t++;
         }
+        timing_pos = t;
 
-        if (bgm_start && bgm_start[m] >= 0) {
-            for (int b = bgm_start[m]; b < bgm_end[m]; b++) {
-                mev_push(&mev, (MeasureEvent){bgm_sorted[b].ev.pos, 3, 0.0, bgm_sorted[b].orig_index});
-            }
+        while (bgm_pos < bgm_raw->len && bgm_sorted[bgm_pos].ev.channel / 1000 < m) bgm_pos++;
+        size_t b = bgm_pos;
+        while (b < bgm_raw->len && bgm_sorted[b].ev.channel / 1000 == m) {
+            mev_push(&mev, (MeasureEvent){bgm_sorted[b].ev.pos, 3, 0.0, bgm_sorted[b].orig_index});
+            b++;
         }
+        bgm_pos = b;
 
         if (mev.len > 0) {
             qsort(mev.items, mev.len, sizeof(MeasureEvent), cmp_mev);
@@ -1204,28 +1294,7 @@ static void generate_timing_and_notes(
             auto_push(auto_samples, (AutoSample){bgm_time[i], wav_id});
         }
     }
-    if (auto_samples->len > 1) {
-        int sorted = 1;
-        for (size_t i = 1; i < auto_samples->len; i++) {
-            AutoSample a = auto_samples->items[i - 1];
-            AutoSample b = auto_samples->items[i];
-            if (a.time_ms > b.time_ms || (a.time_ms == b.time_ms && a.wav_id > b.wav_id)) {
-                sorted = 0;
-                break;
-            }
-        }
-        if (!sorted) qsort(auto_samples->items, auto_samples->len, sizeof(AutoSample), cmp_auto);
-    }
-}
-
-static int osu_is_sorted(const OsuNoteVec *v) {
-    for (size_t i = 1; i < v->len; i++) {
-        const OsuNote *a = &v->items[i - 1];
-        const OsuNote *b = &v->items[i];
-        if (a->time_ms > b->time_ms) return 0;
-        if (a->time_ms == b->time_ms && a->lane > b->lane) return 0;
-    }
-    return 1;
+    if (auto_samples->len > 1) qsort(auto_samples->items, auto_samples->len, sizeof(AutoSample), cmp_auto);
 }
 
 static void dedupe_timing_points(TimingPointVec *tp) {
@@ -1268,6 +1337,96 @@ static void sanitize_osu_field(char *s) {
         }
     }
     trim(s);
+}
+
+static int is_valid_utf8(const unsigned char *s) {
+    if (!s) return 0;
+    while (*s) {
+        unsigned char c = *s++;
+        if (c < 0x80) continue;
+        if ((c & 0xE0) == 0xC0) {
+            if ((s[0] & 0xC0) != 0x80) return 0;
+            if ((c & 0xFE) == 0xC0) return 0;
+            s += 1;
+            continue;
+        }
+        if ((c & 0xF0) == 0xE0) {
+            if ((s[0] & 0xC0) != 0x80 || (s[1] & 0xC0) != 0x80) return 0;
+            if (c == 0xE0 && (s[0] & 0xE0) == 0x80) return 0;
+            if (c == 0xED && (s[0] & 0xE0) == 0xA0) return 0;
+            s += 2;
+            continue;
+        }
+        if ((c & 0xF8) == 0xF0) {
+            if ((s[0] & 0xC0) != 0x80 || (s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
+            if (c == 0xF0 && (s[0] & 0xF0) == 0x80) return 0;
+            if (c > 0xF4) return 0;
+            if (c == 0xF4 && s[0] > 0x8F) return 0;
+            s += 3;
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int mb_to_utf8_cp(const char *src, UINT cp, char *out, size_t out_sz) {
+    if (!src || !src[0] || !out || out_sz == 0) return 0;
+    int wlen = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, src, -1, NULL, 0);
+    if (wlen <= 0) wlen = MultiByteToWideChar(cp, 0, src, -1, NULL, 0);
+    if (wlen <= 0) return 0;
+    wchar_t *wb = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!wb) return 0;
+    int ok = 0;
+    int wgot = MultiByteToWideChar(cp, 0, src, -1, wb, wlen);
+    if (wgot > 0) {
+        int u8len = WideCharToMultiByte(CP_UTF8, 0, wb, -1, NULL, 0, NULL, NULL);
+        if (u8len > 0 && (size_t)u8len <= out_sz) {
+            int ugot = WideCharToMultiByte(CP_UTF8, 0, wb, -1, out, (int)out_sz, NULL, NULL);
+            if (ugot > 0) ok = 1;
+        }
+    }
+    free(wb);
+    return ok;
+}
+
+static void bms_text_to_utf8(const char *src, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!src || !src[0]) return;
+    if (is_valid_utf8((const unsigned char *)src)) {
+        snprintf(out, out_sz, "%s", src);
+        return;
+    }
+    if (mb_to_utf8_cp(src, 932, out, out_sz)) return;
+    if (mb_to_utf8_cp(src, CP_ACP, out, out_sz)) return;
+    snprintf(out, out_sz, "%s", src);
+}
+
+static void strip_trailing_bracket_tag(const char *in, char *main_out, size_t main_sz, char *tag_out, size_t tag_sz) {
+    if (main_out && main_sz) main_out[0] = '\0';
+    if (tag_out && tag_sz) tag_out[0] = '\0';
+    if (!in || !in[0]) return;
+    if (main_out && main_sz) snprintf(main_out, main_sz, "%s", in);
+    if (!main_out || !main_out[0]) return;
+    trim(main_out);
+    size_t n = strlen(main_out);
+    if (n < 3 || main_out[n - 1] != ']') return;
+    char *lb = strrchr(main_out, '[');
+    if (!lb) return;
+    if (lb == main_out) return;
+    if (strchr(lb + 1, '[')) return;
+    size_t tag_len = (size_t)(main_out + n - 1 - (lb + 1));
+    if (tag_len == 0 || tag_len > 40) return;
+    if (tag_out && tag_sz) {
+        size_t c = tag_len < (tag_sz - 1) ? tag_len : (tag_sz - 1);
+        memcpy(tag_out, lb + 1, c);
+        tag_out[c] = '\0';
+        trim(tag_out);
+    }
+    while (lb > main_out && isspace((unsigned char)lb[-1])) lb--;
+    *lb = '\0';
+    trim(main_out);
 }
 
 static int extract_version(const char *in, char *out, size_t out_sz) {
@@ -1486,16 +1645,34 @@ static int write_osu(const char *out_path, const char *input_path, const BmsCont
     }
 
     char version[260];
-    char title_buf[256];
-    char artist_buf[256];
+    char title_raw[256];
+    char artist_raw[256];
+    char title_main_raw[256];
+    char title_tag_raw[64];
+    char title_buf[512];
+    char artist_buf[512];
+    char tags_buf[512];
+    char version_out[260];
     extract_version(input_path, version, sizeof(version));
 
     const char *title = ctx->title[0] ? ctx->title : version;
     const char *artist = ctx->artist[0] ? ctx->artist : "Unknown Artist";
-    copy_field(title_buf, sizeof(title_buf), title);
-    copy_field(artist_buf, sizeof(artist_buf), artist);
+    copy_field(title_raw, sizeof(title_raw), title);
+    copy_field(artist_raw, sizeof(artist_raw), artist);
+    strip_trailing_bracket_tag(title_raw, title_main_raw, sizeof(title_main_raw), title_tag_raw, sizeof(title_tag_raw));
+    if (!title_main_raw[0]) snprintf(title_main_raw, sizeof(title_main_raw), "%s", title_raw);
+    bms_text_to_utf8(title_main_raw, title_buf, sizeof(title_buf));
+    bms_text_to_utf8(artist_raw, artist_buf, sizeof(artist_buf));
+    bms_text_to_utf8(ctx->genre, tags_buf, sizeof(tags_buf));
     sanitize_osu_field(title_buf);
     sanitize_osu_field(artist_buf);
+    sanitize_osu_field(tags_buf);
+    if (display_version && display_version[0]) snprintf(version_out, sizeof(version_out), "%s", display_version);
+    else snprintf(version_out, sizeof(version_out), "%s", version);
+    sanitize_osu_field(version_out);
+    if (title_tag_raw[0]) {
+        snprintf(version_out, sizeof(version_out), "%s", title_tag_raw);
+    }
 
     fprintf(fp, "osu file format v14\r\n\r\n");
     fprintf(fp, "[General]\r\n");
@@ -1517,9 +1694,9 @@ static int write_osu(const char *out_path, const char *input_path, const BmsCont
     fprintf(fp, "Artist:%s\r\n", artist_buf);
     fprintf(fp, "ArtistUnicode:%s\r\n", artist_buf);
     fprintf(fp, "Creator:bme_to_osu\r\n");
-    fprintf(fp, "Version:%s\r\n", (display_version && display_version[0]) ? display_version : version);
+    fprintf(fp, "Version:%s\r\n", version_out);
     fprintf(fp, "Source:\r\n");
-    if (ctx->genre[0]) fprintf(fp, "Tags:%s\r\n", ctx->genre);
+    if (tags_buf[0]) fprintf(fp, "Tags:%s\r\n", tags_buf);
     else fprintf(fp, "Tags:\r\n");
     fprintf(fp, "BeatmapID:0\r\n");
     fprintf(fp, "BeatmapSetID:0\r\n\r\n");
@@ -1779,7 +1956,7 @@ static int process_single_chart(const char *input, const char *tmp_dir, int opt_
 
         generate_timing_and_notes(&ctx, &notes, &timing, &bgm, last_measure, &osu, &tp, &auto_samples);
         dedupe_timing_points(&tp);
-        if (osu.len > 1 && !osu_is_sorted(&osu)) qsort(osu.items, osu.len, sizeof(OsuNote), cmp_osu);
+        if (osu.len > 0) qsort(osu.items, osu.len, sizeof(OsuNote), cmp_osu);
         double od_value = od_from_bms_rank_fixed(ctx.rank_bms);
 
         if (keys == 8) {
@@ -1886,7 +2063,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Usage: %s <map_folder OR root_folder_with_map_subfolders> [-add7k|-only7k] [-addvideo]\n", argv[0]);
         return 1;
     }
-    const char *target = argv[1];
+    const char *target_arg = argv[1];
     int opt_add7k = 0;
     int opt_only7k = 0;
     int opt_addvideo = 0;
@@ -1907,6 +2084,21 @@ int main(int argc, char **argv) {
     char exe_dir[4096], out_dir[4096];
     if (!get_exe_dir(exe_dir, sizeof(exe_dir))) {
         fprintf(stderr, "Cannot resolve exe directory.\n");
+        return 1;
+    }
+    char target[4096];
+    int resolved = 0;
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv && wargc > 1) {
+        wchar_t exe_dir_w[4096];
+        int wn = MultiByteToWideChar(CP_ACP, 0, exe_dir, -1, exe_dir_w, (int)(sizeof(exe_dir_w) / sizeof(exe_dir_w[0])));
+        if (wn > 0) resolved = resolve_input_dir_w(wargv[1], exe_dir_w, target, sizeof(target));
+    }
+    if (wargv) LocalFree(wargv);
+    if (!resolved) resolved = resolve_input_dir(target_arg, exe_dir, target, sizeof(target));
+    if (!resolved) {
+        fprintf(stderr, "Input folder not found: %s\n", target_arg);
         return 1;
     }
     join_path(out_dir, sizeof(out_dir), exe_dir, "output");
@@ -1945,6 +2137,13 @@ int main(int argc, char **argv) {
         char map_name[260];
         copy_field(map_name, sizeof(map_name), path_basename(map_dir));
         sanitize_filename_component(map_name);
+        if ((map_name[0] == '\0' || strchr(map_name, '~') != NULL) && charts.len > 0) {
+            copy_field(map_name, sizeof(map_name), path_basename(charts.items[0]));
+            char *dot = strrchr(map_name, '.');
+            if (dot) *dot = '\0';
+            sanitize_filename_component(map_name);
+        }
+        if (map_name[0] == '\0') copy_field(map_name, sizeof(map_name), "map");
 
         char tmp_dir[4096];
         {
