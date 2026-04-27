@@ -566,6 +566,13 @@ static int wide_dir_to_ansi_path(const wchar_t *wpath, char *out, size_t out_sz)
     return 0;
 }
 
+static int ansi_to_wide(const char *src, wchar_t *out, size_t out_sz) {
+    if (!src || !out || out_sz == 0) return 0;
+    int n = MultiByteToWideChar(CP_ACP, 0, src, -1, out, (int)out_sz);
+    if (n <= 0 || (size_t)n > out_sz) return 0;
+    return 1;
+}
+
 static int resolve_input_dir_w(const wchar_t *input, const wchar_t *exe_dir_w, char *out, size_t out_sz) {
     if (!input || !input[0]) return 0;
     if (is_abs_path_w(input)) {
@@ -1500,6 +1507,30 @@ static void sanitize_filename_component(char *s) {
     if (!s[0]) snprintf(s, 260, "difficulty");
 }
 
+static int looks_like_dos_short_name(const char *s) {
+    if (!s || !s[0]) return 0;
+    const char *t = strrchr(s, '~');
+    if (!t || t == s) return 0;
+    if (!isdigit((unsigned char)t[1])) return 0;
+    for (const char *p = t + 1; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return 0;
+    }
+    int base_len = (int)(t - s);
+    if (base_len <= 0 || base_len > 8) return 0;
+    for (const char *p = s; p < t; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '_')) return 0;
+    }
+    return 1;
+}
+
+static int starts_with_numeric_id(const char *s) {
+    if (!s || !isdigit((unsigned char)s[0])) return 0;
+    int n = 0;
+    while (s[n] && isdigit((unsigned char)s[n])) n++;
+    return n >= 4;
+}
+
 
 static uint32_t crc32_update(uint32_t crc, const unsigned char *buf, size_t len) {
     static uint32_t table[256];
@@ -1829,18 +1860,23 @@ static void collect_map_dirs(const char *target, StringVec *out_dirs) {
 
     if (!strvec_contains_icase(out_dirs, target)) str_push(out_dirs, target);
 
-    char pat[4096];
-    snprintf(pat, sizeof(pat), "%s\\*", target);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
+    wchar_t target_w[4096];
+    if (!ansi_to_wide(target, target_w, sizeof(target_w) / sizeof(target_w[0]))) return;
+    wchar_t pat_w[4096];
+    _snwprintf(pat_w, (sizeof(pat_w) / sizeof(pat_w[0])) - 1, L"%ls\\*", target_w);
+    pat_w[(sizeof(pat_w) / sizeof(pat_w[0])) - 1] = L'\0';
+    WIN32_FIND_DATAW fdw;
+    HANDLE h = FindFirstFileW(pat_w, &fdw);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-        char subdir[4096];
-        join_path(subdir, sizeof(subdir), target, fd.cFileName);
-        if (!strvec_contains_icase(out_dirs, subdir)) str_push(out_dirs, subdir);
-    } while (FindNextFileA(h, &fd));
+        if (!(fdw.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (wcscmp(fdw.cFileName, L".") == 0 || wcscmp(fdw.cFileName, L"..") == 0) continue;
+        wchar_t sub_w[4096];
+        char sub_a[4096];
+        join_path_w(sub_w, sizeof(sub_w) / sizeof(sub_w[0]), target_w, fdw.cFileName);
+        if (!wide_dir_to_ansi_path(sub_w, sub_a, sizeof(sub_a))) continue;
+        if (!strvec_contains_icase(out_dirs, sub_a)) str_push(out_dirs, sub_a);
+    } while (FindNextFileW(h, &fdw));
     FindClose(h);
 }
 
@@ -2025,8 +2061,32 @@ typedef struct {
     PackVec pack;
     char osz_path[4096];
     char tmp_dir[4096];
+    wchar_t desired_osz_path_w[4096];
     int ok;
 } ZipTask;
+
+static void log_created_path(const char *ansi_path, const wchar_t *wide_path) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (h != INVALID_HANDLE_VALUE && h != NULL && GetConsoleMode(h, &mode)) {
+        DWORD wr = 0;
+        static const wchar_t prefix[] = L"Created: ";
+        static const wchar_t nl[] = L"\r\n";
+        WriteConsoleW(h, prefix, (DWORD)(sizeof(prefix) / sizeof(prefix[0]) - 1), &wr, NULL);
+        if (wide_path && wide_path[0]) WriteConsoleW(h, wide_path, (DWORD)wcslen(wide_path), &wr, NULL);
+        else if (ansi_path && ansi_path[0]) {
+            wchar_t wtmp[4096];
+            if (ansi_to_wide(ansi_path, wtmp, sizeof(wtmp) / sizeof(wtmp[0]))) {
+                WriteConsoleW(h, wtmp, (DWORD)wcslen(wtmp), &wr, NULL);
+            } else {
+                WriteConsoleW(h, L"(path)", 6, &wr, NULL);
+            }
+        }
+        WriteConsoleW(h, nl, 2, &wr, NULL);
+        return;
+    }
+    printf("Created: %s\n", ansi_path ? ansi_path : "");
+}
 
 static unsigned __stdcall zip_worker_proc(void *arg) {
     ZipTask *z = (ZipTask *)arg;
@@ -2050,46 +2110,74 @@ static void finish_zip_task(ZipTask *z, int *overall_ok) {
         fprintf(stderr, "Failed to create archive: %s\n", z->osz_path);
         if (overall_ok) *overall_ok = 0;
     } else {
-        printf("Created: %s\n", z->osz_path);
+        const wchar_t *printed_w = NULL;
+        if (z->desired_osz_path_w[0]) {
+            wchar_t src_w[4096];
+            if (ansi_to_wide(z->osz_path, src_w, sizeof(src_w) / sizeof(src_w[0])) &&
+                _wcsicmp(src_w, z->desired_osz_path_w) != 0) {
+                MoveFileExW(src_w, z->desired_osz_path_w, MOVEFILE_REPLACE_EXISTING);
+            }
+            printed_w = z->desired_osz_path_w;
+        }
+        log_created_path(z->osz_path, printed_w);
     }
     cleanup_tmp_from_pack(z->tmp_dir, &z->pack);
     pack_free(&z->pack);
     z->tmp_dir[0] = '\0';
     z->osz_path[0] = '\0';
+    z->desired_osz_path_w[0] = L'\0';
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if ((wargv && wargc < 2) || (!wargv && argc < 2)) {
         fprintf(stderr, "Usage: %s <map_folder OR root_folder_with_map_subfolders> [-add7k|-only7k] [-addvideo]\n", argv[0]);
+        if (wargv) LocalFree(wargv);
         return 1;
     }
     const char *target_arg = argv[1];
     int opt_add7k = 0;
     int opt_only7k = 0;
     int opt_addvideo = 0;
-    for (int i = 2; i < argc; i++) {
-        if (_stricmp(argv[i], "-add7k") == 0) opt_add7k = 1;
-        else if (_stricmp(argv[i], "-only7k") == 0) opt_only7k = 1;
-        else if (_stricmp(argv[i], "-addvideo") == 0) opt_addvideo = 1;
-        else {
-            fprintf(stderr, "Unknown flag: %s\n", argv[i]);
-            return 1;
+    if (wargv) {
+        for (int i = 2; i < wargc; i++) {
+            if (_wcsicmp(wargv[i], L"-add7k") == 0) opt_add7k = 1;
+            else if (_wcsicmp(wargv[i], L"-only7k") == 0) opt_only7k = 1;
+            else if (_wcsicmp(wargv[i], L"-addvideo") == 0) opt_addvideo = 1;
+            else {
+                char bad[1024];
+                if (!wide_to_ansi(wargv[i], bad, sizeof(bad))) snprintf(bad, sizeof(bad), "<unicode-flag>");
+                fprintf(stderr, "Unknown flag: %s\n", bad);
+                LocalFree(wargv);
+                return 1;
+            }
+        }
+    } else {
+        for (int i = 2; i < argc; i++) {
+            if (_stricmp(argv[i], "-add7k") == 0) opt_add7k = 1;
+            else if (_stricmp(argv[i], "-only7k") == 0) opt_only7k = 1;
+            else if (_stricmp(argv[i], "-addvideo") == 0) opt_addvideo = 1;
+            else {
+                fprintf(stderr, "Unknown flag: %s\n", argv[i]);
+                return 1;
+            }
         }
     }
     if (opt_add7k && opt_only7k) {
         fprintf(stderr, "Flags -add7k and -only7k cannot be used together.\n");
+        if (wargv) LocalFree(wargv);
         return 1;
     }
 
     char exe_dir[4096], out_dir[4096];
+    wchar_t out_dir_w[4096];
     if (!get_exe_dir(exe_dir, sizeof(exe_dir))) {
         fprintf(stderr, "Cannot resolve exe directory.\n");
         return 1;
     }
     char target[4096];
     int resolved = 0;
-    int wargc = 0;
-    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     if (wargv && wargc > 1) {
         wchar_t exe_dir_w[4096];
         int wn = MultiByteToWideChar(CP_ACP, 0, exe_dir, -1, exe_dir_w, (int)(sizeof(exe_dir_w) / sizeof(exe_dir_w[0])));
@@ -2103,6 +2191,9 @@ int main(int argc, char **argv) {
     }
     join_path(out_dir, sizeof(out_dir), exe_dir, "output");
     CreateDirectoryA(out_dir, NULL);
+    if (!ansi_to_wide(out_dir, out_dir_w, sizeof(out_dir_w) / sizeof(out_dir_w[0]))) {
+        out_dir_w[0] = L'\0';
+    }
 
     StringVec map_dirs = {0};
     StringVec bg_paths = {0};
@@ -2137,7 +2228,7 @@ int main(int argc, char **argv) {
         char map_name[260];
         copy_field(map_name, sizeof(map_name), path_basename(map_dir));
         sanitize_filename_component(map_name);
-        if ((map_name[0] == '\0' || strchr(map_name, '~') != NULL) && charts.len > 0) {
+        if ((map_name[0] == '\0' || (looks_like_dos_short_name(map_name) && !starts_with_numeric_id(map_name))) && charts.len > 0) {
             copy_field(map_name, sizeof(map_name), path_basename(charts.items[0]));
             char *dot = strrchr(map_name, '.');
             if (dot) *dot = '\0';
@@ -2216,6 +2307,26 @@ int main(int argc, char **argv) {
         char osz_name[320], osz_path[4096];
         snprintf(osz_name, sizeof(osz_name), "%s.osz", map_name);
         join_path(osz_path, sizeof(osz_path), out_dir, osz_name);
+        wchar_t desired_osz_w[4096];
+        desired_osz_w[0] = L'\0';
+        if (out_dir_w[0]) {
+            wchar_t map_w[4096], map_long_w[4096], map_base_w[4096], final_name_w[512];
+            if (ansi_to_wide(map_dir, map_w, sizeof(map_w) / sizeof(map_w[0]))) {
+                DWORD gl = GetLongPathNameW(map_w, map_long_w, (DWORD)(sizeof(map_long_w) / sizeof(map_long_w[0])));
+                const wchar_t *src = (gl > 0 && gl < (DWORD)(sizeof(map_long_w) / sizeof(map_long_w[0]))) ? map_long_w : map_w;
+                const wchar_t *b1 = wcsrchr(src, L'\\');
+                const wchar_t *b2 = wcsrchr(src, L'/');
+                const wchar_t *base = src;
+                if (b1 && b2) base = (b1 > b2) ? (b1 + 1) : (b2 + 1);
+                else if (b1) base = b1 + 1;
+                else if (b2) base = b2 + 1;
+                wcsncpy(map_base_w, base, (sizeof(map_base_w) / sizeof(map_base_w[0])) - 1);
+                map_base_w[(sizeof(map_base_w) / sizeof(map_base_w[0])) - 1] = L'\0';
+                _snwprintf(final_name_w, (sizeof(final_name_w) / sizeof(final_name_w[0])) - 1, L"%ls.osz", map_base_w);
+                final_name_w[(sizeof(final_name_w) / sizeof(final_name_w[0])) - 1] = L'\0';
+                join_path_w(desired_osz_w, sizeof(desired_osz_w) / sizeof(desired_osz_w[0]), out_dir_w, final_name_w);
+            }
+        }
         if (zip_pending_active) {
             WaitForSingleObject(zip_th, INFINITE);
             CloseHandle(zip_th);
@@ -2231,6 +2342,8 @@ int main(int argc, char **argv) {
         pack.arcs.cap = pack.arcs.len = 0;
         snprintf(zip_pending.tmp_dir, sizeof(zip_pending.tmp_dir), "%s", tmp_dir);
         snprintf(zip_pending.osz_path, sizeof(zip_pending.osz_path), "%s", osz_path);
+        wcsncpy(zip_pending.desired_osz_path_w, desired_osz_w, (sizeof(zip_pending.desired_osz_path_w) / sizeof(zip_pending.desired_osz_path_w[0])) - 1);
+        zip_pending.desired_osz_path_w[(sizeof(zip_pending.desired_osz_path_w) / sizeof(zip_pending.desired_osz_path_w[0])) - 1] = L'\0';
         zip_pending.ok = 0;
 
         {
