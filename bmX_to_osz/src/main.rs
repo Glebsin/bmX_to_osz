@@ -1,13 +1,13 @@
 use encoding_rs::SHIFT_JIS;
 use rayon::prelude::*;
 use crc32fast::Hasher as Crc32Hasher;
-use std::collections::HashMap;
+use itoa::Buffer as IntBuf;
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -37,10 +37,10 @@ struct BmsMeta {
     playlevel: String,
     rank: i32,
     bpm: f64,
-    wav: HashMap<u16, String>,
-    bpm_ext: HashMap<u16, f64>,
-    stop_ext: HashMap<u16, f64>,
-    measure_len: HashMap<i32, f64>,
+    wav: Vec<Option<String>>,
+    bpm_ext: Vec<Option<f64>>,
+    stop_ext: Vec<Option<f64>>,
+    measure_len: Vec<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -63,15 +63,13 @@ struct PackItem {
 }
 
 fn pack_push_unique(items: &mut Vec<PackItem>, seen: &mut HashSet<String>, src: PathBuf, name: String) {
-    let key = name.to_ascii_lowercase();
-    if seen.insert(key) {
+    if seen.insert(name.clone()) {
         items.push(PackItem { src: Some(src), mem: None, name });
     }
 }
 
 fn pack_push_mem_unique(items: &mut Vec<PackItem>, seen: &mut HashSet<String>, data: Vec<u8>, name: String) {
-    let key = name.to_ascii_lowercase();
-    if seen.insert(key) {
+    if seen.insert(name.clone()) {
         items.push(PackItem { src: None, mem: Some(data), name });
     }
 }
@@ -111,8 +109,59 @@ fn build_display_version(base_name: &str, playlevel_text: &str) -> String {
     }
 }
 
+fn clean_title(title: &str) -> String {
+    const TAGS: [&str; 5] = ["BEGINNER", "NORMAL", "HYPER", "ANOTHER", "LEGGENDARIA"];
+    let mut t = title.trim().to_string();
+    loop {
+        let cur = t.trim_end().to_string();
+        let mut changed = false;
+        for tag in TAGS {
+            // Remove suffix like " [ANOTHER]" or "(HYPER)".
+            for (l, r) in [('[', ']'), ('(', ')')] {
+                let mut p = String::with_capacity(tag.len() + 2);
+                p.push(l);
+                p.push_str(tag);
+                p.push(r);
+                let up = cur.to_ascii_uppercase();
+                if up.ends_with(&p) {
+                    let cut = cur.len().saturating_sub(p.len());
+                    t = cur[..cut].trim_end().to_string();
+                    changed = true;
+                    break;
+                }
+            }
+            if changed { break; }
+            // Remove plain suffix like " - ANOTHER" / " ANOTHER".
+            let up = cur.to_ascii_uppercase();
+            let plain = format!(" {}", tag);
+            let dash = format!(" - {}", tag);
+            if up.ends_with(&plain) || up.ends_with(&dash) {
+                let cut = if up.ends_with(&dash) { cur.len().saturating_sub(dash.len()) } else { cur.len().saturating_sub(plain.len()) };
+                t = cur[..cut].trim_end().to_string();
+                changed = true;
+                break;
+            }
+        }
+        if !changed { break; }
+    }
+    t
+}
+
 fn trim_ascii_ws(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn strip_prefix_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let sb = s.as_bytes();
+    let pb = prefix.as_bytes();
+    if sb.len() < pb.len() {
+        return None;
+    }
+    let head = &sb[..pb.len()];
+    if !head.eq_ignore_ascii_case(pb) {
+        return None;
+    }
+    std::str::from_utf8(&sb[pb.len()..]).ok()
 }
 
 fn decode62(c: u8) -> Option<u16> {
@@ -147,7 +196,7 @@ fn decode_text(bytes: &[u8]) -> String {
 
 fn is_chart_ext(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).map(|e| {
-        let e = e.to_ascii_lowercase(); e == "bms" || e == "bme"
+        let e = e.to_ascii_lowercase(); e == "bms" || e == "bme" || e == "bml"
     }).unwrap_or(false)
 }
 
@@ -157,94 +206,70 @@ fn collect_chart_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
         let p = ent?.path();
         if p.is_file() && is_chart_ext(&p) { out.push(p); }
     }
-    out.sort();
-    Ok(out)
-}
-
-fn has_chart_ext_in_dir(dir: &Path) -> Result<bool> {
-    for ent in fs::read_dir(dir)? {
-        let p = ent?.path();
-        if p.is_file() && is_chart_ext(&p) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn collect_sp_chart_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    for p in collect_chart_files_in_dir(dir)? {
-        if is_sp_chart_file(&p)? {
-            out.push(p);
-        }
+    if out.len() > 1 {
+        out.sort();
     }
     Ok(out)
-}
-
-fn parse_channel_from_line(line: &str) -> Option<i32> {
-    let b = line.as_bytes();
-    if b.len() < 7 || b[0] != b'#' || b[6] != b':' { return None; }
-    if !(b[1].is_ascii_digit() && b[2].is_ascii_digit() && b[3].is_ascii_digit()) { return None; }
-    if !(b[4].is_ascii_digit() && b[5].is_ascii_digit()) { return None; }
-    Some(((b[4] - b'0') as i32) * 10 + (b[5] - b'0') as i32)
 }
 
 fn parse_player_line(t: &str) -> Option<i32> {
-    let s = t.trim_start();
-    if s.len() < 7 || !s[..7].eq_ignore_ascii_case("#PLAYER") {
+    let mut s = t.as_bytes();
+    while let Some((&c, rest)) = s.split_first() {
+        if c.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
+    }
+    if s.len() < 7 || !s[..7].eq_ignore_ascii_case(b"#PLAYER") {
         return None;
     }
-    let rest = s[7..].trim_start();
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() { None } else { digits.parse::<i32>().ok() }
-}
-
-fn is_sp_chart_text(text: &str) -> bool {
-    let mut player = None;
-    let (mut has11, mut has21) = (false, false);
-    for raw in text.lines() {
-        let t = raw.trim();
-        if t.is_empty() { continue; }
-        if player.is_none() {
-            player = parse_player_line(t);
-        }
-        if let Some(ch) = parse_channel_from_line(t) {
-            if (0x11..=0x19).contains(&ch) { has11 = true; }
-            if (0x21..=0x29).contains(&ch) { has21 = true; }
-        }
+    let mut i = 7usize;
+    while i < s.len() && s[i].is_ascii_whitespace() {
+        i += 1;
     }
-    if player == Some(1) { return true; }
-    if player.is_none() { return has11 && !has21; }
-    false
-}
-
-fn is_sp_chart_file(path: &Path) -> Result<bool> {
-    let text = decode_text(&fs::read(path)?);
-    Ok(is_sp_chart_text(&text))
+    let start = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    std::str::from_utf8(&s[start..i]).ok()?.parse::<i32>().ok()
 }
 
 fn collect_map_tasks(target: &Path) -> Result<Vec<MapTask>> {
     if !target.exists() || !target.is_dir() { bail!("Input folder not found: {}", target.display()); }
     let mut out = Vec::<MapTask>::new();
-    let charts_root = collect_sp_chart_files_in_dir(target)?;
+    // Fast startup scan: only collect chart candidates here.
+    // SP filtering is done later in process_map per chart.
+    let charts_root = collect_chart_files_in_dir(target)?;
     if !charts_root.is_empty() {
         out.push(MapTask { dir: target.to_path_buf(), charts: charts_root });
     }
+    let mut subdirs = Vec::<PathBuf>::new();
     for ent in fs::read_dir(target)? {
         let p = ent?.path();
         if p.is_dir() {
-            let charts = collect_sp_chart_files_in_dir(&p)?;
-            if !charts.is_empty() {
-                out.push(MapTask { dir: p, charts });
-            }
+            subdirs.push(p);
         }
     }
+    let mut sub_tasks: Vec<MapTask> = subdirs
+        .par_iter()
+        .filter_map(|p| {
+            match collect_chart_files_in_dir(p) {
+                Ok(charts) if !charts.is_empty() => Some(MapTask { dir: p.clone(), charts }),
+                _ => None,
+            }
+        })
+        .collect();
+    out.append(&mut sub_tasks);
     out.sort_by(|a, b| a.dir.cmp(&b.dir));
     Ok(out)
 }
 
 fn parse_opts(args: &[OsString]) -> Result<(PathBuf, Opts)> {
-    if args.len() < 2 { bail!("Usage: bmX_to_osz_rust.exe <map_folder OR root_folder_with_map_subfolders> [-add7k|-only7k] [-addvideo]"); }
+    if args.len() < 2 { bail!("Usage: bmX_to_osz.exe <map_folder OR root_folder_with_map_subfolders> [-add7k|-only7k] [-addvideo]"); }
     let mut o = Opts::default();
     for f in &args[2..] {
         match f.to_string_lossy().to_ascii_lowercase().as_str() {
@@ -353,35 +378,69 @@ fn fmt_g15(v: f64) -> String {
     }
 }
 
-fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(BmsMeta, Vec<Note>, Vec<Tp>, Vec<AutoSample>)> {
+fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(bool, bool, BmsMeta, Vec<Note>, Vec<Tp>, Vec<AutoSample>)> {
     let mut m = BmsMeta { bpm: 130.0, rank: -1, ..Default::default() };
+    m.wav.resize(2048, None);
+    m.bpm_ext.resize(2048, None);
+    m.stop_ext.resize(2048, None);
+    m.measure_len.resize(256, 1.0);
     let mut ev = Vec::<Ev>::new();
     let mut token_base: u16 = 36;
     let (mut has16, mut has17, mut has1819) = (false, false, false);
+    let mut player = None;
+    let (mut has11, mut has21) = (false, false);
 
-    for raw in text.lines() {
-        let t = raw.trim();
-        if t.is_empty() || !t.starts_with('#') { continue; }
-        let u = t.to_ascii_uppercase();
+    let tb = text.as_bytes();
+    let mut start = 0usize;
+    for i in 0..=tb.len() {
+        if i != tb.len() && tb[i] != b'\n' {
+            continue;
+        }
+        let mut line = &tb[start..i];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len().saturating_sub(1)];
+        }
+        start = i.saturating_add(1);
+        while let Some((&c, rest)) = line.split_first() {
+            if c.is_ascii_whitespace() {
+                line = rest;
+            } else {
+                break;
+            }
+        }
+        while line.last().map(|c| c.is_ascii_whitespace()).unwrap_or(false) {
+            line = &line[..line.len().saturating_sub(1)];
+        }
+        if line.is_empty() || line[0] != b'#' {
+            continue;
+        }
+        let Ok(t) = std::str::from_utf8(line) else { continue; };
         let b = t.as_bytes();
-        if let Some(v) = u.strip_prefix("#TITLE ") { m.title = t[t.len()-v.len()..].trim().to_string(); continue; }
-        if let Some(v) = u.strip_prefix("#ARTIST ") { m.artist = t[t.len()-v.len()..].trim().to_string(); continue; }
-        if let Some(v) = u.strip_prefix("#GENRE ") { m.genre = t[t.len()-v.len()..].trim().to_string(); continue; }
-        if let Some(v) = u.strip_prefix("#DIFFICULTY ") { m.difficulty = t[t.len()-v.len()..].trim().to_string(); continue; }
-        if let Some(v) = u.strip_prefix("#PLAYLEVEL ") { m.playlevel = t[t.len()-v.len()..].trim().to_string(); continue; }
-        if let Some(v) = u.strip_prefix("#RANK ") { m.rank = t[t.len()-v.len()..].trim().parse().unwrap_or(-1); continue; }
-        if let Some(v) = u.strip_prefix("#BPM ") { m.bpm = t[t.len()-v.len()..].trim().parse().unwrap_or(m.bpm); continue; }
-        if let Some(v) = u.strip_prefix("#BASE ") {
-            let n = t[t.len()-v.len()..].trim().parse::<u16>().unwrap_or(36);
+        if player.is_none() {
+            player = parse_player_line(t);
+        }
+        if let Some(v) = strip_prefix_ascii_case(t, "#TITLE ") { m.title = v.trim().to_string(); continue; }
+        if let Some(v) = strip_prefix_ascii_case(t, "#ARTIST ") { m.artist = v.trim().to_string(); continue; }
+        if let Some(v) = strip_prefix_ascii_case(t, "#GENRE ") { m.genre = v.trim().to_string(); continue; }
+        if let Some(v) = strip_prefix_ascii_case(t, "#DIFFICULTY ") { m.difficulty = v.trim().to_string(); continue; }
+        if let Some(v) = strip_prefix_ascii_case(t, "#PLAYLEVEL ") { m.playlevel = v.trim().to_string(); continue; }
+        if let Some(v) = strip_prefix_ascii_case(t, "#RANK ") { m.rank = v.trim().parse().unwrap_or(-1); continue; }
+        if let Some(v) = strip_prefix_ascii_case(t, "#BPM ") { m.bpm = v.trim().parse().unwrap_or(m.bpm); continue; }
+        if let Some(v) = strip_prefix_ascii_case(t, "#BASE ") {
+            let n = v.trim().parse::<u16>().unwrap_or(36);
             token_base = if n == 62 { 62 } else { 36 };
             continue;
         }
 
-        if b.len() >= 7 && b[0] == b'#' && b[1].is_ascii_digit() && b[2].is_ascii_digit() && b[3].is_ascii_digit() && &u[4..6] == "02" && b[6] == b':' {
+        if b.len() >= 7 && b[0] == b'#' && b[1].is_ascii_digit() && b[2].is_ascii_digit() && b[3].is_ascii_digit() && b[4] == b'0' && b[5] == b'2' && b[6] == b':' {
             let mnum = t[1..4].parse::<i32>().unwrap_or(0);
             if let Ok(v) = t[7..].trim().parse::<f64>() {
-                if v > 0.0 {
-                    m.measure_len.insert(mnum, v);
+                if v > 0.0 && mnum >= 0 {
+                    let mi = mnum as usize;
+                    if mi >= m.measure_len.len() {
+                        m.measure_len.resize(mi + 1, 1.0);
+                    }
+                    m.measure_len[mi] = v;
                 }
             }
             continue;
@@ -389,19 +448,37 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
         if t.len() >= 8 && t[..4].eq_ignore_ascii_case("#WAV") {
             if let Some(id) = tok_bx(&t.as_bytes()[4..6], token_base) {
                 let val = t[6..].trim().to_string();
-                if !val.is_empty() { m.wav.insert(id, val); }
+                if !val.is_empty() {
+                    let idx = id as usize;
+                    if idx >= m.wav.len() {
+                        m.wav.resize(idx + 1, None);
+                    }
+                    m.wav[idx] = Some(val);
+                }
             }
             continue;
         }
         if t.len() >= 8 && t[..4].eq_ignore_ascii_case("#BPM") && !t.as_bytes()[4].is_ascii_whitespace() {
             if let Some(id) = tok_bx(&t.as_bytes()[4..6], token_base) {
-                if let Ok(v) = t[6..].trim().parse::<f64>() { m.bpm_ext.insert(id, v); }
+                if let Ok(v) = t[6..].trim().parse::<f64>() {
+                    let idx = id as usize;
+                    if idx >= m.bpm_ext.len() {
+                        m.bpm_ext.resize(idx + 1, None);
+                    }
+                    m.bpm_ext[idx] = Some(v);
+                }
             }
             continue;
         }
         if t.len() >= 9 && t[..5].eq_ignore_ascii_case("#STOP") {
             if let Some(id) = tok_bx(&t.as_bytes()[5..7], token_base) {
-                if let Ok(v) = t[7..].trim().parse::<f64>() { m.stop_ext.insert(id, v); }
+                if let Ok(v) = t[7..].trim().parse::<f64>() {
+                    let idx = id as usize;
+                    if idx >= m.stop_ext.len() {
+                        m.stop_ext.resize(idx + 1, None);
+                    }
+                    m.stop_ext[idx] = Some(v);
+                }
             }
             continue;
         }
@@ -414,6 +491,8 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
         } else {
             -1
         };
+        if (0x11..=0x19).contains(&ch) { has11 = true; }
+        if (0x21..=0x29).contains(&ch) { has21 = true; }
         let data = t[7..].trim().as_bytes();
         if data.len() < 2 || data.len() % 2 != 0 { continue; }
         let slots = data.len() / 2;
@@ -452,6 +531,14 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
         }
     }
     let use_iidx_layout = has16 && has1819 && !has17;
+    let is_sp = if player == Some(1) {
+        true
+    } else if player.is_none() {
+        has11 && !has21
+    } else {
+        false
+    };
+    let is_5plus1 = is_sp && has16 && !has1819;
 
     if m.title.is_empty() { m.title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").to_string(); }
     if m.artist.is_empty() { m.artist = "Unknown Artist".to_string(); }
@@ -461,26 +548,33 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
         let mnum = e.pos.floor() as i32;
         if mnum > max_measure { max_measure = mnum; }
     }
-    for &k in m.measure_len.keys() {
-        if k > max_measure { max_measure = k; }
+    if !m.measure_len.is_empty() {
+        let last = (m.measure_len.len() - 1) as i32;
+        if last > max_measure {
+            max_measure = last;
+        }
     }
     let mut prefix = vec![0.0f64; (max_measure.max(0) as usize) + 2];
     for i in 0..=max_measure.max(0) as usize {
-        let ml = *m.measure_len.get(&(i as i32)).unwrap_or(&1.0);
+        let ml = if i < m.measure_len.len() { m.measure_len[i] } else { 1.0 };
         prefix[i + 1] = prefix[i] + 4.0 * ml;
     }
-    let mut ev2: Vec<(f64, Ev)> = ev.into_iter().map(|e| {
+    for e in &mut ev {
         let mnum = e.pos.floor() as i32;
         let frac = e.pos - mnum as f64;
-        let ml = *m.measure_len.get(&mnum).unwrap_or(&1.0);
-        let beats = prefix[mnum.max(0) as usize] + frac * (4.0 * ml);
-        (beats, e)
-    }).collect();
-    if ev2.len() > 1 {
-        ev2.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
+        let ml = if mnum >= 0 {
+            let mi = mnum as usize;
+            if mi < m.measure_len.len() { m.measure_len[mi] } else { 1.0 }
+        } else {
+            1.0
+        };
+        e.pos = prefix[mnum.max(0) as usize] + frac * (4.0 * ml);
+    }
+    if ev.len() > 1 {
+        ev.sort_by(|a, b| {
+            a.pos.partial_cmp(&b.pos)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.ch.cmp(&b.1.ch))
+                .then(a.ch.cmp(&b.ch))
         });
     }
 
@@ -490,9 +584,10 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
     let mut tps = vec![Tp { t: 0, bpm }];
     let mut notes = Vec::<Note>::new();
     let mut autos = Vec::<AutoSample>::new();
-    let mut ln_open: HashMap<i32, (i32, u16)> = HashMap::new();
+    let mut ln_open: [Option<(i32, u16)>; 20] = [None; 20];
 
-    for (beats_abs, e) in ev2 {
+    for e in ev {
+        let beats_abs = e.pos;
         let beats = beats_abs - beats_cur;
         ms_cur += beats * 60000.0 / bpm;
         beats_cur = beats_abs;
@@ -504,7 +599,7 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
                 tps.push(Tp { t: now, bpm });
             }
             EvKind::BpmExt => {
-                if let Some(v) = m.bpm_ext.get(&e.id) {
+                if let Some(Some(v)) = m.bpm_ext.get(e.id as usize) {
                     if *v > 0.0 {
                         bpm = *v;
                         tps.push(Tp { t: now, bpm });
@@ -512,7 +607,7 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
                 }
             }
             EvKind::Stop => {
-                if let Some(v) = m.stop_ext.get(&e.id) {
+                if let Some(Some(v)) = m.stop_ext.get(e.id as usize) {
                     ms_cur += (60000.0 / bpm) * (*v / 48.0);
                 }
             }
@@ -543,7 +638,11 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
                 }
                 if let Some(lane) = lane_from_ch(e.ch, cut_scratch, use_iidx_layout) {
                     if lane < 0 { continue; }
-                    if let Some((start, swav)) = ln_open.remove(&lane) {
+                    let li = lane as usize;
+                    if li >= ln_open.len() {
+                        continue;
+                    }
+                    if let Some((start, swav)) = ln_open[li].take() {
                         let mut end = now;
                         if end <= start {
                             end = start + 1;
@@ -553,15 +652,17 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
                             autos.push(AutoSample { t: end, wav: e.id });
                         }
                     } else {
-                        ln_open.insert(lane, (now, e.id));
+                        ln_open[li] = Some((now, e.id));
                     }
                 }
             }
         }
     }
 
-    for (lane, (start, swav)) in ln_open {
-        notes.push(Note { lane, t: start, end: start + 120, ln: true, wav: swav });
+    for (lane, v) in ln_open.iter().enumerate() {
+        if let Some((start, swav)) = *v {
+            notes.push(Note { lane: lane as i32, t: start, end: start + 120, ln: true, wav: swav });
+        }
     }
 
     if notes.len() > 1 {
@@ -581,11 +682,23 @@ fn parse_bms_from_text(path: &Path, text: &str, cut_scratch: bool) -> Result<(Bm
         autos_dedup.push(a);
     }
     autos = autos_dedup;
-    Ok((m, notes, tps, autos))
+    Ok((is_sp, is_5plus1, m, notes, tps, autos))
 }
 
 fn build_osu_bytes(meta: &BmsMeta, notes: &[Note], tp: &[Tp], autos: &[AutoSample], keys: i32, bg_name: &str, video_name: &str, display_version: &str) -> Result<Vec<u8>> {
     let mut f = Vec::<u8>::with_capacity(256 * 1024);
+    let wav_short: Vec<Option<&str>> = meta
+        .wav
+        .iter()
+        .map(|o| {
+            o.as_ref().map(|v| {
+                Path::new(v)
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or(v.as_str())
+            })
+        })
+        .collect();
     writeln!(f, "osu file format v14\r")?;
     writeln!(f, "\r")?;
     writeln!(f, "[General]\r")?;
@@ -603,11 +716,12 @@ fn build_osu_bytes(meta: &BmsMeta, notes: &[Note], tp: &[Tp], autos: &[AutoSampl
 
     writeln!(f, "\r")?;
     writeln!(f, "[Metadata]\r")?;
-    writeln!(f, "Title:{}\r", meta.title)?;
-    writeln!(f, "TitleUnicode:{}\r", meta.title)?;
+    let clean = clean_title(&meta.title);
+    writeln!(f, "Title:{}\r", clean)?;
+    writeln!(f, "TitleUnicode:{}\r", clean)?;
     writeln!(f, "Artist:{}\r", meta.artist)?;
     writeln!(f, "ArtistUnicode:{}\r", meta.artist)?;
-    writeln!(f, "Creator:bme_to_osu\r")?;
+    writeln!(f, "Creator:bmX_to_osz\r")?;
     writeln!(f, "Version:{}\r", display_version)?;
     writeln!(f, "Source:\r")?;
     writeln!(f, "Tags:{}\r", meta.genre)?;
@@ -630,38 +744,56 @@ fn build_osu_bytes(meta: &BmsMeta, notes: &[Note], tp: &[Tp], autos: &[AutoSampl
         writeln!(f, "Video,0,\"{}\"\r", video_name)?;
     }
     for a in autos {
-        if let Some(w) = meta.wav.get(&a.wav) {
-            let s = Path::new(w).file_name().and_then(|x| x.to_str()).unwrap_or(w);
+        if let Some(Some(s)) = wav_short.get(a.wav as usize) {
             writeln!(f, "Sample,{},0,\"{}\",100\r", a.t, s)?;
         }
     }
 
     writeln!(f, "\r")?;
     writeln!(f, "[TimingPoints]\r")?;
-    for t in tp { writeln!(f, "{},{}{},4,2,0,0,1,0\r", t.t, "", fmt_g15(60000.0 / t.bpm))?; }
+    let mut ibuf = IntBuf::new();
+    for t in tp {
+        f.extend_from_slice(ibuf.format(t.t).as_bytes());
+        f.push(b',');
+        f.extend_from_slice(fmt_g15(60000.0 / t.bpm).as_bytes());
+        f.extend_from_slice(b",4,2,0,0,1,0\r\n");
+    }
 
     writeln!(f, "\r")?;
     writeln!(f, "[HitObjects]\r")?;
     for n in notes {
         let x = ((512.0 / keys as f64) * n.lane as f64 + (256.0 / keys as f64)).floor() as i32;
-        let sample = meta.wav.get(&n.wav)
-            .map(|v| Path::new(v).file_name().and_then(|x| x.to_str()).unwrap_or(""))
+        let sample = wav_short
+            .get(n.wav as usize)
+            .and_then(|v| *v)
             .unwrap_or("");
         if !n.ln {
-            if sample.is_empty() { writeln!(f, "{},192,{},1,0,0:0:0:0:\r", x, n.t)?; }
-            else { writeln!(f, "{},192,{},1,0,0:0:0:100:{}\r", x, n.t, sample)?; }
+            f.extend_from_slice(ibuf.format(x).as_bytes());
+            f.extend_from_slice(b",192,");
+            f.extend_from_slice(ibuf.format(n.t).as_bytes());
+            if sample.is_empty() {
+                f.extend_from_slice(b",1,0,0:0:0:0:\r\n");
+            } else {
+                f.extend_from_slice(b",1,0,0:0:0:100:");
+                f.extend_from_slice(sample.as_bytes());
+                f.extend_from_slice(b"\r\n");
+            }
         } else {
-            if sample.is_empty() { writeln!(f, "{},192,{},128,0,{}:0:0:0:0:\r", x, n.t, n.end)?; }
-            else { writeln!(f, "{},192,{},128,0,{}:0:0:0:100:{}\r", x, n.t, n.end, sample)?; }
+            f.extend_from_slice(ibuf.format(x).as_bytes());
+            f.extend_from_slice(b",192,");
+            f.extend_from_slice(ibuf.format(n.t).as_bytes());
+            f.extend_from_slice(b",128,0,");
+            f.extend_from_slice(ibuf.format(n.end).as_bytes());
+            if sample.is_empty() {
+                f.extend_from_slice(b":0:0:0:0:\r\n");
+            } else {
+                f.extend_from_slice(b":0:0:0:100:");
+                f.extend_from_slice(sample.as_bytes());
+                f.extend_from_slice(b"\r\n");
+            }
         }
     }
     Ok(f)
-}
-
-fn osu_has_hitobjects(data: &[u8]) -> bool {
-    let s = String::from_utf8_lossy(data);
-    let Some(idx) = s.find("[HitObjects]") else { return false; };
-    s[idx..].lines().skip(1).any(|l| !l.trim().is_empty())
 }
 
 fn collect_bg_image_names(exe_dir: &Path) -> Result<Vec<String>> {
@@ -671,11 +803,11 @@ fn collect_bg_image_names(exe_dir: &Path) -> Result<Vec<String>> {
         for ent in fs::read_dir(&bg_dir)? {
             let p = ent?.path();
             if !p.is_file() { continue; }
-            let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            let name = p.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
             if name.is_empty() { continue; }
             let low = name.to_ascii_lowercase();
             if low.ends_with(".png") || low.ends_with(".jpg") || low.ends_with(".jpeg") || low.ends_with(".bmp") || low.ends_with(".webp") {
-                names.push(name.to_string());
+                names.push(name);
             }
         }
     }
@@ -701,8 +833,9 @@ fn collect_assets(map_dir: &Path, exe_dir: &Path, include_video: bool, bg_names:
     let mut bg = String::from("1.png");
     let mut first_video = String::new();
     let mut first_video_path = PathBuf::new();
-    let mut pack = Vec::<PackItem>::new();
-    let mut seen = HashSet::<String>::new();
+    // Front-load capacity to reduce reallocations on large audio folders.
+    let mut pack = Vec::<PackItem>::with_capacity(2048);
+    let mut seen = HashSet::<String>::with_capacity(4096);
     let mut stack = vec![map_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for ent in fs::read_dir(&dir)? {
@@ -714,14 +847,17 @@ fn collect_assets(map_dir: &Path, exe_dir: &Path, include_video: bool, bg_names:
             if !p.is_file() {
                 continue;
             }
-        let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("").to_string();
+        let name = p.file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
         if name.is_empty() { continue; }
-        let low_name = name.to_ascii_lowercase();
-        if low_name == "1.png" && p.parent() == Some(map_dir) {
+        if name.eq_ignore_ascii_case("1.png") && p.parent() == Some(map_dir) {
             bg = name.clone();
         }
-        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
-        let is_video = matches!(ext.as_str(), "mp4" | "avi" | "mkv" | "webm" | "mov");
+        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+        let is_video = ext.eq_ignore_ascii_case("mp4")
+            || ext.eq_ignore_ascii_case("avi")
+            || ext.eq_ignore_ascii_case("mkv")
+            || ext.eq_ignore_ascii_case("webm")
+            || ext.eq_ignore_ascii_case("mov");
         if include_video && first_video.is_empty() && is_video {
             if let Ok(md) = fs::metadata(&p) {
                 if md.len() >= 5 * 1024 * 1024 {
@@ -730,8 +866,10 @@ fn collect_assets(map_dir: &Path, exe_dir: &Path, include_video: bool, bg_names:
                 }
             }
         }
-        let is_audio = matches!(ext.as_str(), "wav" | "ogg" | "mp3");
-        if is_audio && !low_name.eq_ignore_ascii_case("preview_auto_generator.wav") {
+        let is_audio = ext.eq_ignore_ascii_case("wav")
+            || ext.eq_ignore_ascii_case("ogg")
+            || ext.eq_ignore_ascii_case("mp3");
+        if is_audio && !name.eq_ignore_ascii_case("preview_auto_generator.wav") {
             pack_push_unique(&mut pack, &mut seen, p, name);
         }
         }
@@ -759,25 +897,24 @@ fn collect_assets(map_dir: &Path, exe_dir: &Path, include_video: bool, bg_names:
 
 fn build_osz_store(out: &Path, files: &[PackItem]) -> Result<()> {
     let mut z = BufWriter::with_capacity(1024 * 1024, fs::File::create(out)?);
-    let mut central: Vec<(Vec<u8>, u32, u32, u32)> = Vec::new();
+    let mut central: Vec<(Vec<u8>, u32, u32, u32)> = Vec::with_capacity(files.len());
     let mut buf = vec![0u8; 1024 * 1024];
+    let mut cur_off: u32 = 0;
     for p in files {
         let name = p.name.as_bytes().to_vec();
         let mut hasher = Crc32Hasher::new();
         let mut sz: u32 = 0;
-        let off = z.stream_position()? as u32;
-        z.write_all(&0x04034B50u32.to_le_bytes())?;
-        z.write_all(&20u16.to_le_bytes())?;
-        z.write_all(&0x0008u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u32.to_le_bytes())?;
-        z.write_all(&0u32.to_le_bytes())?;
-        z.write_all(&0u32.to_le_bytes())?;
-        z.write_all(&(name.len() as u16).to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
+        let off = cur_off;
+
+        let mut local_hdr = [0u8; 30];
+        local_hdr[0..4].copy_from_slice(&0x04034B50u32.to_le_bytes());
+        local_hdr[4..6].copy_from_slice(&20u16.to_le_bytes());
+        local_hdr[6..8].copy_from_slice(&0x0008u16.to_le_bytes());
+        local_hdr[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        z.write_all(&local_hdr)?;
         z.write_all(&name)?;
+        cur_off = cur_off.saturating_add((local_hdr.len() + name.len()) as u32);
+
         if let Some(src) = &p.src {
             let mut input = BufReader::with_capacity(1024 * 1024, fs::File::open(src)?);
             loop {
@@ -793,43 +930,45 @@ fn build_osz_store(out: &Path, files: &[PackItem]) -> Result<()> {
             sz = mem.len() as u32;
             z.write_all(mem)?;
         }
+        cur_off = cur_off.saturating_add(sz);
+
         let crc = hasher.finalize();
-        z.write_all(&0x08074B50u32.to_le_bytes())?;
-        z.write_all(&crc.to_le_bytes())?;
-        z.write_all(&sz.to_le_bytes())?;
-        z.write_all(&sz.to_le_bytes())?;
+        let mut dd = [0u8; 16];
+        dd[0..4].copy_from_slice(&0x08074B50u32.to_le_bytes());
+        dd[4..8].copy_from_slice(&crc.to_le_bytes());
+        dd[8..12].copy_from_slice(&sz.to_le_bytes());
+        dd[12..16].copy_from_slice(&sz.to_le_bytes());
+        z.write_all(&dd)?;
+        cur_off = cur_off.saturating_add(dd.len() as u32);
         central.push((name, crc, sz, off));
     }
-    let cd_off = z.stream_position()? as u32;
+    let cd_off = cur_off;
     for (name, crc, sz, off) in &central {
-        z.write_all(&0x02014B50u32.to_le_bytes())?;
-        z.write_all(&20u16.to_le_bytes())?;
-        z.write_all(&20u16.to_le_bytes())?;
-        z.write_all(&0x0008u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&crc.to_le_bytes())?;
-        z.write_all(&sz.to_le_bytes())?;
-        z.write_all(&sz.to_le_bytes())?;
-        z.write_all(&(name.len() as u16).to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u16.to_le_bytes())?;
-        z.write_all(&0u32.to_le_bytes())?;
-        z.write_all(&off.to_le_bytes())?;
+        let mut cd = [0u8; 46];
+        cd[0..4].copy_from_slice(&0x02014B50u32.to_le_bytes());
+        cd[4..6].copy_from_slice(&20u16.to_le_bytes());
+        cd[6..8].copy_from_slice(&20u16.to_le_bytes());
+        cd[8..10].copy_from_slice(&0x0008u16.to_le_bytes());
+        cd[16..20].copy_from_slice(&crc.to_le_bytes());
+        cd[20..24].copy_from_slice(&sz.to_le_bytes());
+        cd[24..28].copy_from_slice(&sz.to_le_bytes());
+        cd[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        cd[42..46].copy_from_slice(&off.to_le_bytes());
+        z.write_all(&cd)?;
         z.write_all(name)?;
+        cur_off = cur_off.saturating_add((cd.len() + name.len()) as u32);
     }
-    let cd_end = z.stream_position()? as u32;
-    z.write_all(&0x06054B50u32.to_le_bytes())?;
-    z.write_all(&0u16.to_le_bytes())?;
-    z.write_all(&0u16.to_le_bytes())?;
-    z.write_all(&(central.len() as u16).to_le_bytes())?;
-    z.write_all(&(central.len() as u16).to_le_bytes())?;
-    z.write_all(&(cd_end - cd_off).to_le_bytes())?;
-    z.write_all(&cd_off.to_le_bytes())?;
-    z.write_all(&0u16.to_le_bytes())?;
+    let cd_end = cur_off;
+    let mut eocd = [0u8; 22];
+    eocd[0..4].copy_from_slice(&0x06054B50u32.to_le_bytes());
+    eocd[4..6].copy_from_slice(&0u16.to_le_bytes());
+    eocd[6..8].copy_from_slice(&0u16.to_le_bytes());
+    eocd[8..10].copy_from_slice(&(central.len() as u16).to_le_bytes());
+    eocd[10..12].copy_from_slice(&(central.len() as u16).to_le_bytes());
+    eocd[12..16].copy_from_slice(&(cd_end - cd_off).to_le_bytes());
+    eocd[16..20].copy_from_slice(&cd_off.to_le_bytes());
+    eocd[20..22].copy_from_slice(&0u16.to_le_bytes());
+    z.write_all(&eocd)?;
     Ok(())
 }
 
@@ -839,40 +978,58 @@ fn process_map(task: &MapTask, out_dir: &Path, exe_dir: &Path, opts: Opts, bg_na
     let map_name = map_dir.file_name().and_then(|s| s.to_str()).unwrap_or("map").to_string();
     let (bg_name, video_name, mut pack_items) = collect_assets(map_dir, exe_dir, opts.addvideo, bg_names)?;
     let vid = if opts.addvideo { video_name.clone() } else { String::new() };
-    let chart_jobs: Result<Vec<Vec<PackItem>>> = task.charts
-        .par_iter()
-        .map(|chart| -> Result<Vec<PackItem>> {
+    let parse_chart = |chart: &PathBuf| -> Result<Vec<PackItem>> {
             let mut out = Vec::<PackItem>::new();
             let text = decode_text(&fs::read(chart)?);
-            if !is_sp_chart_text(&text) {
-                return Ok(out);
-            }
             let raw_stem = chart.file_stem().and_then(|s| s.to_str()).unwrap_or("chart");
             let stem = trim_ascii_ws(raw_stem);
             if stem.is_empty() {
                 return Ok(out);
             }
             if !opts.only7k {
-                let (meta, notes8, tp, autos) = parse_bms_from_text(chart, &text, false)?;
-                let ver = build_display_version(stem, &meta.playlevel);
-                let osu_data = build_osu_bytes(&meta, &notes8, &tp, &autos, 8, &bg_name, &vid, &ver)?;
-                if osu_has_hitobjects(&osu_data) {
+                let (is_sp, is_5plus1, meta, notes8, tp, autos) = parse_bms_from_text(chart, &text, false)?;
+                if !is_sp {
+                    return Ok(out);
+                }
+                if is_5plus1 {
+                    return Ok(out);
+                }
+                if !notes8.is_empty() {
+                    let ver = build_display_version(stem, &meta.playlevel);
+                    let osu_data = build_osu_bytes(&meta, &notes8, &tp, &autos, 8, &bg_name, &vid, &ver)?;
                     out.push(PackItem { src: None, mem: Some(osu_data), name: format!("{}.osu", stem) });
                 }
             }
             if opts.add7k || opts.only7k {
-                let (meta, notes7, tp, autos) = parse_bms_from_text(chart, &text, true)?;
-                let ver = build_display_version(stem, &meta.playlevel);
-                let osu_data = build_osu_bytes(&meta, &notes7, &tp, &autos, 7, &bg_name, &vid, &ver)?;
-                if osu_has_hitobjects(&osu_data) {
+                let (is_sp, is_5plus1, meta, notes7, tp, autos) = parse_bms_from_text(chart, &text, true)?;
+                if !is_sp {
+                    return Ok(out);
+                }
+                if is_5plus1 {
+                    return Ok(out);
+                }
+                if !notes7.is_empty() {
+                    let ver = build_display_version(stem, &meta.playlevel);
+                    let osu_data = build_osu_bytes(&meta, &notes7, &tp, &autos, 7, &bg_name, &vid, &ver)?;
                     out.push(PackItem { src: None, mem: Some(osu_data), name: format!("{}_7k.osu", stem) });
                 }
             }
             Ok(out)
-        })
-        .collect();
+    };
+    // For small chart counts (common single-map case), rayon startup/scheduling overhead
+    // tends to cost more than it saves.
+    let chart_jobs: Result<Vec<Vec<PackItem>>> = if task.charts.len() <= 3 {
+        // Single-map fast path: avoid rayon/sync overhead entirely.
+        let mut v = Vec::with_capacity(task.charts.len());
+        for c in &task.charts {
+            v.push(parse_chart(c)?);
+        }
+        Ok(v)
+    } else {
+        task.charts.par_iter().map(parse_chart).collect()
+    };
 
-    let mut pack_seen: HashSet<String> = pack_items.iter().map(|p| p.name.to_ascii_lowercase()).collect();
+    let mut pack_seen: HashSet<String> = pack_items.iter().map(|p| p.name.clone()).collect();
     for set in chart_jobs? {
         for item in set {
             if let Some(data) = item.mem {
@@ -880,11 +1037,14 @@ fn process_map(task: &MapTask, out_dir: &Path, exe_dir: &Path, opts: Opts, bg_na
             }
         }
     }
+    let has_osu = pack_items.iter().any(|p| p.name.to_ascii_lowercase().ends_with(".osu"));
+    if !has_osu {
+        println!("Skipped (no eligible charts): {}", map_dir.display());
+        return Ok(());
+    }
 
     let osz = out_dir.join(format!("{}.osz", map_name));
-    if pack_items.len() > 1 {
-        pack_items.sort_by(|a, b| a.name.cmp(&b.name));
-    }
+    // Keep insertion order to avoid extra O(n log n) work on large audio packs.
     build_osz_store(&osz, &pack_items)?;
     println!("Created: {}", osz.display());
     Ok(())
@@ -894,19 +1054,20 @@ fn main() -> Result<()> {
     let args_os: Vec<OsString> = env::args_os().collect();
 
     let t0 = Instant::now();
-    eprintln!("[boot] process started");
     let (target, opts) = parse_opts(&args_os)?;
-    eprintln!("[boot] args parsed in {} ms", t0.elapsed().as_millis());
-    eprintln!("Starting: {}", target.display());
-    let map_tasks = if target.is_dir() && has_chart_ext_in_dir(&target)? {
-        let charts = collect_chart_files_in_dir(&target)?;
-        if charts.is_empty() { Vec::new() } else { vec![MapTask { dir: target.clone(), charts }] }
+    println!("Starting: {}", target.display());
+    let root_charts = if target.is_dir() {
+        collect_chart_files_in_dir(&target)?
+    } else {
+        Vec::new()
+    };
+    let map_tasks = if !root_charts.is_empty() {
+        vec![MapTask { dir: target.clone(), charts: root_charts }]
     } else {
         collect_map_tasks(&target)?
     };
     if map_tasks.is_empty() { bail!("No SP chart folders with .bme/.bms found in: {}", target.display()); }
-    eprintln!("[boot] map scan done in {} ms", t0.elapsed().as_millis());
-    eprintln!("MapsFound: {}", map_tasks.len());
+    println!("MapsFound: {}", map_tasks.len());
 
     let exe_dir = env::current_exe()?.parent().unwrap().to_path_buf();
     let out_dir = exe_dir.join("output");
@@ -922,7 +1083,7 @@ fn main() -> Result<()> {
         });
     } else {
         for m in &map_tasks {
-            eprintln!("Processing: {}", m.dir.display());
+            // quiet hot path logging
             if let Err(e) = process_map(m, &out_dir, &exe_dir, opts, &bg_names) {
                 eprintln!("Failed {}: {e}", m.dir.display());
             }
