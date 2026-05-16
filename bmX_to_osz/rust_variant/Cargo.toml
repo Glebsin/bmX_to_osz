@@ -1,0 +1,16 @@
+﻿[package]
+name = "bmX_to_osz_rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rayon = "1"
+encoding_rs = "0.8"
+crc32fast = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
