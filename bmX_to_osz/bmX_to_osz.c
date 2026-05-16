@@ -1086,7 +1086,7 @@ static void split_raw_events(const RawEventVec *raw, NoteEventVec *notes, RawEve
             raw_push(timing, t);
         } else if (ch == 1) {
             RawEvent b = re;
-            b.channel = ch + measure * 1000;
+            b.channel = 1 + measure * 1000;
             raw_push(bgm, b);
         }
     }
@@ -1281,6 +1281,9 @@ static void generate_timing_and_notes(
                     int ed = t;
                     if (ed <= st) ed = st + 1;
                     osu_push(osu_notes, (OsuNote){cur.lane, st, ed, 1, open_wav[cur.lane]});
+                    if (cur.wav_id >= 0) {
+                        auto_push(auto_samples, (AutoSample){ed, cur.wav_id});
+                    }
                     open_ln[cur.lane] = 0;
                     open_wav[cur.lane] = -1;
                 }
@@ -1302,6 +1305,18 @@ static void generate_timing_and_notes(
         }
     }
     if (auto_samples->len > 1) qsort(auto_samples->items, auto_samples->len, sizeof(AutoSample), cmp_auto);
+    if (auto_samples->len > 0) {
+        size_t w = 0;
+        for (size_t r = 0; r < auto_samples->len; r++) {
+            AutoSample a = auto_samples->items[r];
+            if (w > 0) {
+                AutoSample p = auto_samples->items[w - 1];
+                if (p.wav_id == a.wav_id && abs(p.time_ms - a.time_ms) <= 1) continue;
+            }
+            auto_samples->items[w++] = a;
+        }
+        auto_samples->len = w;
+    }
 }
 
 static void dedupe_timing_points(TimingPointVec *tp) {
@@ -2129,6 +2144,9 @@ static void finish_zip_task(ZipTask *z, int *overall_ok) {
 }
 
 int main(int argc, char **argv) {
+    LARGE_INTEGER perf_freq, perf_start, perf_end;
+    QueryPerformanceFrequency(&perf_freq);
+    QueryPerformanceCounter(&perf_start);
     int wargc = 0;
     LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     if ((wargv && wargc < 2) || (!wargv && argc < 2)) {
@@ -2371,5 +2389,11 @@ int main(int argc, char **argv) {
     str_free(&bg_paths);
     str_free(&bg_names);
     str_free(&map_dirs);
+    QueryPerformanceCounter(&perf_end);
+    {
+        long long dt = perf_end.QuadPart - perf_start.QuadPart;
+        double ms = (double)dt * 1000.0 / (double)perf_freq.QuadPart;
+        printf("ExecutionTimeMs: %.0f\n", ms);
+    }
     return overall_ok ? 0 : 1;
 }
