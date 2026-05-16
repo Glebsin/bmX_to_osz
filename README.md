@@ -25,4 +25,4 @@ bmX_to_osz.exe "C:\Games\LR2oraja Endless Dream\music\othermaps" -add7k -addvide
 bmX_to_osz.exe "C:\Games\LR2oraja Endless Dream\music\bms\somemap" -only7k
 
 
-how compile: gcc -O3 -flto -fomit-frame-pointer -funroll-loops -DNDEBUG -o bmX_to_osz.exe bmX_to_osz.c -lwinmm
+how compile: cargo build --release
